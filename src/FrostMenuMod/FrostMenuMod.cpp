@@ -29,7 +29,11 @@ constexpr std::uintptr_t kSetUiTransformRva = 0x10504B0;
 constexpr std::size_t kCustomScenarioButtonOffset = 0xF0;
 constexpr std::size_t kContinueButtonOffset = 0xD0;
 constexpr std::size_t kUiElementTransformOffset = 0xC0;
-constexpr float kMultiplayerVerticalGap = 62.0f;
+// The stock menu rows are spaced by 44 UI units (Continue -> Scenario -> ...).
+constexpr float kMultiplayerVerticalGap = 44.0f;
+// The hidden custom row's authored label is offset to the right by this amount.
+// Compensate horizontally so its title and summary share the stock column center.
+constexpr float kMultiplayerHorizontalOffset = 60.0f;
 constexpr std::uint32_t kCustomScenarioPanelId = 0x60;
 
 // Verified against Frostpunk.exe SHA-256
@@ -281,6 +285,7 @@ bool configureMenuPanel(void* panel) {
                     safeRead(static_cast<std::uint8_t*>(continueButton) +
                                  kUiElementTransformOffset,
                              continueTransform)) {
+                    transform.x = continueTransform.x - kMultiplayerHorizontalOffset;
                     transform.y = continueTransform.y - kMultiplayerVerticalGap;
                     const auto setTransform = reinterpret_cast<SetUiTransform>(
                         g_gameBase + kSetUiTransformRva);
