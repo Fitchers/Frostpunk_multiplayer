@@ -374,6 +374,42 @@ void printCurrentValues(HANDLE process, const ScanState& state, std::size_t limi
     }
 }
 
+void printMemory(HANDLE process, std::uint64_t address, std::size_t requestedSize) {
+    constexpr std::size_t kMaximumPeekSize = 64 * 1024;
+    if (requestedSize == 0 || requestedSize > kMaximumPeekSize) {
+        fail("Peek size must be between 1 and 65536 bytes.");
+    }
+
+    std::vector<std::uint8_t> bytes(requestedSize);
+    SIZE_T bytesRead = 0;
+    if (!ReadProcessMemory(process, reinterpret_cast<LPCVOID>(address), bytes.data(),
+                           bytes.size(), &bytesRead) || bytesRead == 0) {
+        fail("ReadProcessMemory failed at target address: " + win32Error(GetLastError()));
+    }
+    bytes.resize(bytesRead);
+
+    for (std::size_t row = 0; row < bytes.size(); row += 16) {
+        const auto rowSize = std::min<std::size_t>(16, bytes.size() - row);
+        std::cout << "0x" << std::hex << std::uppercase << std::setw(16)
+                  << std::setfill('0') << (address + row) << "  ";
+        for (std::size_t column = 0; column < 16; ++column) {
+            if (column < rowSize) {
+                std::cout << std::setw(2) << static_cast<unsigned>(bytes[row + column]);
+            } else {
+                std::cout << "  ";
+            }
+            std::cout << (column == 7 ? "  " : " ");
+        }
+        std::cout << " |";
+        for (std::size_t column = 0; column < rowSize; ++column) {
+            const auto value = bytes[row + column];
+            std::cout << (value >= 0x20 && value <= 0x7e ? static_cast<char>(value) : '.');
+        }
+        std::cout << "|\n";
+    }
+    std::cout << std::dec << std::nouppercase << std::setfill(' ');
+}
+
 bool configureWatchpoints(HANDLE thread, const std::vector<std::uint64_t>& addresses) {
     CONTEXT context{};
     context.ContextFlags = CONTEXT_DEBUG_REGISTERS;
@@ -784,6 +820,7 @@ void printUsage() {
         "  FrostProbe watch --state coal.scan\n"
         "  FrostProbe override-r8 --pid 1234 --address 0x... --match-rdx 0x... --from -1 --to 100\n"
         "  FrostProbe set-coal --state coal.scan --target 200\n"
+        "  FrostProbe peek --process Frostpunk.exe --address 0x... --bytes 256\n"
         "  FrostProbe list --state coal.scan [--limit 50]\n";
 }
 
@@ -874,6 +911,15 @@ int wmain(int argc, wchar_t** argv) {
             const auto target = parseInt32(argumentValue(args, L"--target"));
             const auto state = loadState(statePath);
             setCoalTarget(state, target);
+            return 0;
+        }
+
+        if (command == L"peek") {
+            const DWORD pid = pidFromArguments(args);
+            const auto address = parseUint64(argumentValue(args, L"--address"));
+            const auto size = parseSize(argumentValue(args, L"--bytes"));
+            auto process = openProcessForRead(pid);
+            printMemory(process.value, address, size);
             return 0;
         }
 
