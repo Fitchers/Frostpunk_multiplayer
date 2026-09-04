@@ -29,11 +29,12 @@
 #include "../LaunchControl.h"
 #include "../OverlayControl.h"
 #include "../SessionControl.h"
+#include "../ClockSync.h"
 
 namespace {
 
 constexpr std::uint32_t kProtocolMagic = 0x31504246;  // "FBP1"
-constexpr std::uint16_t kProtocolVersion = 8;
+constexpr std::uint16_t kProtocolVersion = 10;
 constexpr int kChannel = 17;
 constexpr int kSendUnreliable = 0;
 constexpr int kSendReliable = 2;
@@ -460,8 +461,13 @@ public:
         MemoryBarrier();
         return control_->localPauseValue != 0;
     }
+    bool localPause() const {
+        return control_ && InterlockedCompareExchange(&control_->localPauseValue, 0, 0) != 0;
+    }
     LONG commandPause(bool paused) {
         if (!control_ || !InterlockedCompareExchange(&control_->modReady, 0, 0)) return 0;
+        const LONG current = InterlockedCompareExchange(&control_->pauseCommandSequence, 0, 0);
+        if (current && (control_->pauseCommandValue != 0) == paused) return current;
         InterlockedExchange(&control_->pauseCommandValue, paused ? 1 : 0);
         MemoryBarrier();
         return InterlockedIncrement(&control_->pauseCommandSequence);
@@ -1282,6 +1288,7 @@ private:
         if (pause.paused != 0 && pause.paused != 1) return;
         if (pause.request && pause.request != startRequest_) return;
         const bool paused = pause.paused != 0;
+        if (!pause.request) peerPauseRequested_ = paused;
         if (pause.delayMs) {
             if (pause.request && !paused) sessionBarrierReleased_ = true;
             pendingPause_.active = true;
@@ -1289,7 +1296,7 @@ private:
             pendingPause_.deadline = std::chrono::steady_clock::now() +
                 std::chrono::milliseconds((std::min)(pause.delayMs, 5000u));
         } else if (!(startCommitted_ && !sessionBarrierReleased_ && !paused)) {
-            gameSession_.commandPause(paused);
+            gameSession_.commandPause(paused || peerPauseRequested_ || clockHold_);
         }
         print(paused ? "[sync] второй игрок поставил общую паузу."
                      : "[sync] второй игрок снял общую паузу.");
@@ -1300,6 +1307,7 @@ private:
         if (state.paused != 0 && state.paused != 1) return;
         if (state.gameTimeMs < 0) return;
         peerSession_ = state;
+        peerSessionReceived_ = std::chrono::steady_clock::now();
     }
 
     void sendSessionState() {
@@ -1313,42 +1321,50 @@ private:
     void pollGameSession(const std::chrono::steady_clock::time_point now) {
         const auto localState = gameSession_.state();
         if (pendingPause_.active && now >= pendingPause_.deadline) {
-            gameSession_.commandPause(pendingPause_.paused);
+            gameSession_.commandPause(pendingPause_.paused || peerPauseRequested_ || clockHold_);
             pendingPause_ = {};
         }
         if (const auto pause = gameSession_.localPauseEvent()) {
             if (startCommitted_ && !sessionBarrierReleased_ && !*pause) {
                 gameSession_.commandPause(true);
                 print("[sync] стартовая пауза останется до загрузки второго города.");
-            } else if (connected_) {
+            }
+            if (connected_) {
                 sendPause(*pause);
                 print(*pause ? "[sync] общая пауза включена."
                              : "[sync] общая пауза снята.");
             }
         }
 
-        // Hold each loaded city BEFORE checking whether the other city is loaded.
-        if (startCommitted_ && !sessionBarrierReleased_ && localState.available &&
-            localState.loaded && !localState.paused) gameSession_.commandPause(true);
-        if (!startCommitted_ || sessionBarrierReleased_ || !host_ ||
-            !localState.available || !localState.loaded || !localState.paused || !peerSession_ ||
-            peerSession_->request != startRequest_ || !peerSession_->loaded ||
-            !peerSession_->paused) return;
-        const LONG64 skew = localState.gameTimeMs > peerSession_->gameTimeMs
-            ? localState.gameTimeMs - peerSession_->gameTimeMs
-            : peerSession_->gameTimeMs - localState.gameTimeMs;
-        if (skew > frostsession::allowedStartSkewMs) {
-            if (!skewReported_) {
-                print("[sync] запуск удерживается: рассинхрон игрового времени больше 3 секунд.");
-                skewReported_ = true;
+        // Keep the leading city still and let the lagging city simulate normally.
+        // Peer/UI holds remain authoritative, and correction holds are never echoed.
+        if (connected_ && localState.available && localState.loaded) {
+            const bool fresh = peerSession_ && now - peerSessionReceived_ < std::chrono::seconds(2);
+            const bool waiting = !fresh || !peerSession_->loaded;
+            const bool hold = waiting || frostsync::holdAhead(localState.gameTimeMs,
+                peerSession_->gameTimeMs, clockHold_);
+            gameSession_.commandPause(hold || peerPauseRequested_);
+            if (hold != clockHold_) {
+                clockHold_ = hold;
+                gameSession_.commandPause(hold || peerPauseRequested_);
+                // Frame-sized corrections are normal; do not flood the chat.
+                if (hold && (waiting || localState.gameTimeMs - peerSession_->gameTimeMs > 60000) &&
+                    !clockWaitReported_) {
+                    print("[sync] город ожидает выравнивания игрового времени.");
+                    clockWaitReported_ = true;
+                } else if (!hold && clockWaitReported_) {
+                    print("[sync] время выровнено; город продолжает работу.");
+                    clockWaitReported_ = false;
+                }
             }
-            return;
         }
-        constexpr std::uint32_t resumeDelayMs = 1500;
-        sendPause(false, startRequest_, resumeDelayMs);
-        pendingPause_ = {true, false, now + std::chrono::milliseconds(resumeDelayMs)};
-        sessionBarrierReleased_ = true;
-        print("[sync] оба города загружены; одновременный старт через 1,5 секунды.");
+        // Once both cities exist, correction replaces the initial all-city hold.
+        if (startCommitted_ && !sessionBarrierReleased_ && peerSession_ &&
+            localState.loaded && peerSession_->loaded &&
+            peerSession_->request == startRequest_) {
+            sessionBarrierReleased_ = true;
+            gameSession_.commandPause(clockHold_ || peerPauseRequested_);
+        }
     }
 
     void sendStart(MessageType type, std::uint32_t request, LONG state, LONG mapIndex = -1) {
@@ -1381,7 +1397,7 @@ private:
             startRequest_ = start.request;
             const LONG state = localLaunch().state;
             prepared_ = state == frostlaunch::ready;
-            launchDeadline_ = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            launchDeadline_ = std::chrono::steady_clock::now() + std::chrono::minutes(10);
             sendStart(MessageType::startReady, start.request, state);
         } else if (type == MessageType::startReady && host_ && waitingStart_ && start.request == startRequest_) {
             waitingStart_ = false;
@@ -1395,7 +1411,7 @@ private:
                 return;
             }
             hostMapPreparing_ = true;
-            launchDeadline_ = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+            launchDeadline_ = std::chrono::steady_clock::now() + std::chrono::minutes(10);
             print("[game] host-map: хост подготавливает карту и её точный индекс.");
         } else if (type == MessageType::startCommit && !host_ && prepared_ &&
                    !startCommitted_ && start.request == startRequest_ &&
@@ -1585,6 +1601,7 @@ private:
                       (header.type == MessageType::hello ? " (hello)" : " (connected)"));
                 if (header.type == MessageType::hello) sendHello(MessageType::helloAck);
                 overlay_.connected(playerName_, peerName_);
+                sendPause(gameSession_.localPause());
             } else if (connected_ &&
                        ((header.type >= MessageType::startPrepare &&
                          header.type <= MessageType::startResult) ||
@@ -1676,7 +1693,7 @@ private:
             }
             if (connected_ && now >= nextSessionState) {
                 sendSessionState();
-                nextSessionState = now + std::chrono::seconds(1);
+                nextSessionState = now + std::chrono::milliseconds(25);
             }
             if (connected_ && watchFrostpunk_ && now >= nextCityRead) {
                 if (const auto city = readLocalCity(frostpunkProcessId_)) {
@@ -1728,7 +1745,11 @@ private:
         bool paused = true;
         std::chrono::steady_clock::time_point deadline{};
     } pendingPause_;
+    bool peerPauseRequested_ = false;
     std::optional<SessionStatePayload> peerSession_;
+    std::chrono::steady_clock::time_point peerSessionReceived_{};
+    bool clockHold_ = false;
+    bool clockWaitReported_ = false;
     bool sessionBarrierReleased_ = false;
     bool skewReported_ = false;
     bool frostpunkMissingReported_ = false;

@@ -8,7 +8,7 @@
 namespace frostsession {
 
 constexpr DWORD magic = 0x31534246; // "FBS1"
-constexpr DWORD version = 2;
+constexpr DWORD version = 3;
 constexpr LONG allowedStartSkewMs = 3000;
 
 struct Control {
@@ -20,7 +20,7 @@ struct Control {
     LONG reservedClock = 0;
     volatile LONG loadGeneration = 0;
 
-    // Mod -> bridge: a player used Space or one of the native speed controls.
+    // Mod -> bridge: any locally owned timer hold, excluding the network token.
     volatile LONG localPauseSequence = 0;
     volatile LONG localPauseValue = 1;
 
@@ -34,7 +34,7 @@ struct Control {
 static_assert(sizeof(Control) == 56);
 
 inline std::wstring name(DWORD pid) {
-    return L"Local\\FrostBridgeSessionV2-" + std::to_wstring(pid);
+    return L"Local\\FrostBridgeSessionV3-" + std::to_wstring(pid);
 }
 
 } // namespace frostsession

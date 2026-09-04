@@ -18,8 +18,8 @@ function Start-Bridge([string[]]$Arguments) {
 try {
  # Synthetic per-PID mailboxes. No live Frostpunk memory or files are modified.
  foreach($id in 4000000001,4000000002) {
-  $map=[IO.MemoryMappedFiles.MemoryMappedFile]::CreateNew("Local\FrostBridgeLaunchV2-$id",16)
-  $view=$map.CreateViewAccessor(); $view.Write(0,[uint32]0x324C4246); $view.Write(4,[uint32]2); $view.Write(8,[int]1); $view.Write(12,[int]-1)
+  $map=[IO.MemoryMappedFiles.MemoryMappedFile]::CreateNew("Local\FrostBridgeLaunchV3-$id",16)
+  $view=$map.CreateViewAccessor(); $view.Write(0,[uint32]0x324C4246); $view.Write(4,[uint32]3); $view.Write(8,[int]1); $view.Write(12,[int]-1)
   $maps+=,$map; $views+=,$view
  }
  $listener=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,0)

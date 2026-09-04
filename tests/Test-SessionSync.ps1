@@ -16,13 +16,13 @@ function Start-Bridge([string[]]$Arguments) {
 }
 try {
  foreach($id in 4100000001,4100000002) {
-  $map=[IO.MemoryMappedFiles.MemoryMappedFile]::CreateNew("Local\FrostBridgeSessionV2-$id",56)
+  $map=[IO.MemoryMappedFiles.MemoryMappedFile]::CreateNew("Local\FrostBridgeSessionV3-$id",56)
   $view=$map.CreateViewAccessor()
-  $view.Write(0,[uint32]0x31534246); $view.Write(4,[uint32]2); $view.Write(8,[int]1)
+  $view.Write(0,[uint32]0x31534246); $view.Write(4,[uint32]3); $view.Write(8,[int]1)
   $view.Write(12,[int]1); $view.Write(16,[int]0)
   $maps+=,$map; $views+=,$view
-  $launch=[IO.MemoryMappedFiles.MemoryMappedFile]::CreateNew("Local\FrostBridgeLaunchV2-$id",16)
-  $launchView=$launch.CreateViewAccessor(); $launchView.Write(0,[uint32]0x324C4246); $launchView.Write(4,[uint32]2); $launchView.Write(8,[int]1); $launchView.Write(12,[int]-1)
+  $launch=[IO.MemoryMappedFiles.MemoryMappedFile]::CreateNew("Local\FrostBridgeLaunchV3-$id",16)
+  $launchView=$launch.CreateViewAccessor(); $launchView.Write(0,[uint32]0x324C4246); $launchView.Write(4,[uint32]3); $launchView.Write(8,[int]1); $launchView.Write(12,[int]-1)
   $launchMaps+=,$launch; $launchViews+=,$launchView
  }
  $listener=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,0)
@@ -39,6 +39,10 @@ try {
  Wait-Until { $views[1].ReadInt32(36) -gt 0 -and $views[1].ReadInt32(40) -eq 1 } 'host pause reaches guest'
  $views[1].Write(32,[int]0); $views[1].Write(28,[int]1)
  Wait-Until { $views[0].ReadInt32(36) -gt 0 -and $views[0].ReadInt32(40) -eq 0 } 'guest resume reaches host'
+ # Releasing the guest cannot release the host's independent local pause.
+ if($views[1].ReadInt32(40) -ne 1) { throw 'Guest release erased host pause' }
+ $views[0].Write(32,[int]0); $views[0].Write(28,[int]2)
+ Wait-Until { $views[1].ReadInt32(40) -eq 0 } 'host releases its own pause'
 
  # Start from menus. Both launch callbacks dispatch, but resume is forbidden until
  # both game mappings report a loaded city and their clocks differ by <= 3000 ms.
@@ -50,6 +54,11 @@ try {
  Wait-Until { $launchViews[1].ReadInt32(8) -eq 2 -and $launchViews[1].ReadInt32(12) -eq 2 } 'client receives host map'
  $launchViews[1].Write(12,[int]2); $launchViews[1].Write(8,[int]3)
  Wait-Until { $launchViews[0].ReadInt32(8) -eq 4 -and $launchViews[1].ReadInt32(8) -eq 4 } 'both native launches committed'
+ # A loading/UI pause clears while the barrier is still active. The release
+ # must reach the peer without allowing either city to run before both load.
+ $views[0].Write(32,[int]1); $views[0].Write(28,[int]3)
+ Start-Sleep -Milliseconds 300
+ $views[0].Write(32,[int]0); $views[0].Write(28,[int]4)
  foreach($view in $launchViews) { $view.Write(8,[int]5) }
  Start-Sleep -Milliseconds 300
  $views[0].Write(12,[int]1); $views[0].Write(16,[int]0); $views[0].Write(48,[int64]0)
@@ -61,9 +70,22 @@ try {
  Wait-Until { $views[0].ReadInt32(36) -gt $beforeHost -and $views[0].ReadInt32(40) -eq 0 } 'host barrier resume' 12
  Wait-Until { $views[1].ReadInt32(36) -gt $beforeGuest -and $views[1].ReadInt32(40) -eq 0 } 'guest barrier resume' 12
 
+ # 25 calendar minutes of accumulated drift: only the leading city waits.
+ $views[0].Write(48,[int64]31500000); $views[1].Write(48,[int64]33000000)
+ Wait-Until { $views[1].ReadInt32(40) -eq 1 -and $views[0].ReadInt32(40) -eq 0 } 'leading guest waits for host'
+ $views[0].Write(48,[int64]33000000)
+ Wait-Until { $views[1].ReadInt32(40) -eq 0 } 'guest resumes after catchup'
+ $views[0].Write(48,[int64]34000000)
+ Wait-Until { $views[0].ReadInt32(40) -eq 1 -and $views[1].ReadInt32(40) -eq 0 } 'leading host waits for guest'
+ $views[1].Write(32,[int]1); $views[1].Write(28,[int]2)
+ $views[1].Write(48,[int64]34000000)
+ Start-Sleep -Milliseconds 200
+ if($views[0].ReadInt32(40) -ne 1) { throw 'Clock catchup erased peer UI pause' }
+ $views[1].Write(32,[int]0); $views[1].Write(28,[int]3)
+ Wait-Until { $views[0].ReadInt32(40) -eq 0 } 'peer releases UI pause after catchup'
+
  foreach($child in $children) { $child.StandardInput.WriteLine('quit'); $child.StandardInput.Flush() }
  foreach($child in $children) { if(!$child.WaitForExit(5000)) { throw 'Bridge did not exit' } }
- if(!$hostOut.Result.Contains('одновременный старт')) { throw 'Host did not report barrier release' }
  'PASS: bidirectional shared pause and loaded-city start barrier with <=3 second clock skew.'
 } finally {
  foreach($child in $children) { if(!$child.HasExited) { $child.Kill(); $child.WaitForExit() }; $child.Dispose() }

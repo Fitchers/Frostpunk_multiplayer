@@ -6,6 +6,39 @@ Read-only analysis of both live processes on 2026-09-04. Heap addresses are not 
 
 ## Pause
 
+### Update 2026-09-05: timer reasons and continuous correction
+
+Current implementation supersedes the UserPause-only prototype described below.
+GameplayTimer pointer RVA `0x2B68510`, vtable `0x1D716F0`, reason array `+0xB8`,
+count `+0xC0`. Native add/remove reason functions: `0xF6C530` / `0xF6CA80`.
+Reason identity is a pointer. The mod owns one static network token and never
+removes the engine's user/UI reasons. Only non-network reasons propagate to peers.
+Session IPC V3 retains the 56-byte layout but changes pause-command semantics.
+
+Protocol 10 continuously compares calendar times (25 ms network publication).
+Only the leading simulation is held; the lagging city runs its ordinary updates.
+Stale peer data (>2 seconds) or an unloaded peer holds the local city. Correction
+starts above 3000 ms and releases below 500 ms. Native time is not rewritten.
+This is approximate synchronization, not deterministic lockstep. In live PIDs
+11916/13072, 20 samples over 5 seconds showed 0/4800/9600 ms skew while both
+clocks progressed. The observed native calendar quantum was 4800 ms, so a hard
+3000 ms bound is not established. Opening UI remains a separate shared pause.
+
+### Map launch update
+
+Launch IPC V3: mapIndex -1 waits for the host's real Start click. The hook at
+`0x1A8ADE0` captures panel `+0x110` and defers the original function until the
+client prepares that index. Client selection uses `0x1A8B880`; index readback
+must match before commit. Stock entitlement checks remain inside native Start.
+Prepared clients cannot independently launch while awaiting commit.
+Success is now acknowledged after a city actually loads, not merely after the
+callback returns. Both PIDs above confirmed mapIndex 1 and loaded cities after
+the host selection at 02:42:24, with native callbacks 28 ms apart and load
+confirmations at 02:42:27.731 / 02:42:27.873. No client Start was issued by the
+agent. Mode is currently the first endless mode; difficulty/seed are not copied.
+
+### Earlier UserPause-only prototype (superseded)
+
 `BUTTON_PAUSE` string RVA 0x2147368 is bound at 0x1B1A51D to callback
 0x1B1A8D0. That callback reads an event value -1 for pause (0/1/2 for speeds),
 calls speed selector 0x11BD080 for nonnegative values, then calls

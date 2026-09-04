@@ -145,6 +145,7 @@ ULONGLONG g_launchDeadline = 0;
 void* g_endlessSelection = nullptr;
 void* g_endlessConfig = nullptr;
 MainMenuUpdate g_originalEndlessBuild = nullptr, g_originalEndlessShow = nullptr;
+MenuPanelCallback g_originalEndlessStart = nullptr;
 HANDLE g_overlayMapping = nullptr;
 frostoverlay::Control* g_overlayControl = nullptr;
 HWND g_overlayWindow = nullptr;
@@ -264,7 +265,7 @@ InlineHook g_callbackHook;
 InlineHook g_scenariosUpdateHook;
 InlineHook g_scenariosStartHook;
 InlineHook g_scenarioRowHook;
-InlineHook g_endlessBuildHook, g_endlessShowHook;
+InlineHook g_endlessBuildHook, g_endlessShowHook, g_endlessStartHook;
 
 void* panelElement(void* panel, std::size_t elementOffset) {
     void* holder = nullptr;
@@ -693,22 +694,41 @@ bool nativeTimeState(std::uintptr_t& object, bool& paused, LONG64& timeMs) {
     return true;
 }
 
+// Timer reasons are pointer-identity tokens. This token belongs only to networking.
+const char g_networkPauseReason[] = "FrostBridgeNetworkPause";
+bool readTimerPause(std::uintptr_t& timer, bool& local, bool& network) {
+    std::uintptr_t vtable = 0, reasons = 0;
+    int count = 0;
+    if (!safeCopyMemory(g_gameBase + 0x2B68510, &timer, sizeof(timer)) || !timer ||
+        !safeCopyMemory(timer, &vtable, sizeof(vtable)) || vtable != g_gameBase + 0x1D716F0 ||
+        !safeCopyMemory(timer + 0xB8, &reasons, sizeof(reasons)) ||
+        !safeCopyMemory(timer + 0xC0, &count, sizeof(count)) || count < 0 || count > 128) return false;
+    local = network = false;
+    for (int i = 0; i < count; ++i) {
+        std::uintptr_t reason = 0;
+        if (!safeCopyMemory(reasons + i * sizeof(reason), &reason, sizeof(reason))) return false;
+        if (reason == reinterpret_cast<std::uintptr_t>(g_networkPauseReason)) network = true;
+        else local = true;
+    }
+    return true;
+}
+
 bool applyNativePause(bool pause) {
-    std::uintptr_t object = 0;
-    bool actual = false;
-    LONG64 time = 0;
-    if (!nativeTimeState(object, actual, time)) return false;
-    // Fail closed on an unsupported instruction stream, even if a launcher was bypassed.
-    constexpr unsigned char expected[]{0x48,0x89,0x5C,0x24,0x10,0x57,0x48,0x83,0xEC,0x20};
+    std::uintptr_t timer = 0;
+    bool local = false, network = false;
+    if (!readTimerPause(timer, local, network)) return false;
+    if (network == pause) return true;
+    using TimerReason = void(__fastcall*)(void*, const void*);
+    const auto rva = pause ? 0xF6C530 : 0xF6CA80;
+    constexpr unsigned char expected[]{0x48,0x89,0x5C,0x24,0x18};
     unsigned char code[sizeof(expected)]{};
-    if (!safeCopyMemory(g_gameBase + 0x11BD0E0, code, sizeof(code)) ||
+    if (!safeCopyMemory(g_gameBase + rva, code, sizeof(code)) ||
         std::memcmp(code, expected, sizeof(code))) return false;
-    using SetPause = void(__fastcall*)(void*, bool, bool);
     __try {
-        reinterpret_cast<SetPause>(g_gameBase + 0x11BD0E0)(
-            reinterpret_cast<void*>(object), pause, false);
+        reinterpret_cast<TimerReason>(g_gameBase + rva)(
+            reinterpret_cast<void*>(timer), g_networkPauseReason);
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
-    return nativeTimeState(object, actual, time) && actual == pause;
+    return readTimerPause(timer, local, network) && network == pause;
 }
 
 void observeSessionInput(const MSG&) {
@@ -744,16 +764,17 @@ void advanceSessionControl() {
             static_cast<LONG>(frostoverlay::Connection::connected);
     const LONG sequence = InterlockedCompareExchange(
         &g_sessionControl->pauseCommandSequence, 0, 0);
-    bool ownChange = false;
     if (justLoaded && connected) g_pendingInitialPause = true;
-    if (g_pendingInitialPause && applyNativePause(true)) {
-        ownChange = true;
+    if (!connected) {
+        applyNativePause(false); // Release only our reason when the bridge disconnects.
         g_pendingInitialPause = false;
     }
-    if (sequence && sequence != g_lastPauseCommand) {
+    if (g_pendingInitialPause && applyNativePause(true)) {
+        g_pendingInitialPause = false;
+    }
+    if (connected && sequence && sequence != g_lastPauseCommand) {
         MemoryBarrier();
         if (applyNativePause(g_sessionControl->pauseCommandValue != 0)) {
-            ownChange = true;
             g_lastPauseCommand = sequence;
             InterlockedExchange(&g_sessionControl->pauseResultSequence, sequence);
         } // Unavailable during loading: retry; never acknowledge a synthetic click.
@@ -765,9 +786,16 @@ void advanceSessionControl() {
         InterlockedExchange(&g_sessionControl->gameLoaded, 0);
         return;
     }
-    if (!justLoaded && !ownChange && paused != g_sessionPaused) publishLocalPause(paused);
-    g_sessionPaused = paused;
-    InterlockedExchange(&g_sessionControl->paused, paused ? 1 : 0);
+    std::uintptr_t timer = 0;
+    bool localPause = false, networkPause = false;
+    if (!readTimerPause(timer, localPause, networkPause)) {
+        InterlockedExchange(&g_sessionControl->gameLoaded, 0);
+        return;
+    }
+    // Only locally owned reasons are sent to the peer; network holds never echo.
+    if (justLoaded || localPause != g_sessionPaused) publishLocalPause(localPause);
+    g_sessionPaused = localPause;
+    InterlockedExchange(&g_sessionControl->paused, (localPause || networkPause) ? 1 : 0);
     InterlockedExchange64(&g_sessionControl->gameTimeMs, nativeTime);
     InterlockedExchange(&g_sessionControl->gameLoaded, 1);
 }
@@ -1399,6 +1427,26 @@ void __fastcall endlessShowHook(void* panel) {
     if (g_launchStage == 2) g_endlessConfig = panel;
 }
 
+void __fastcall endlessStartHook(void* panel, void* event) {
+    if (g_launchControl && g_launchStage >= 2 && g_launchStage <= 3) {
+        // Only the host's real Start click finalizes the selected map. Client
+        // clicks cannot race the network commit or silently select another map.
+        if (g_launchStage == 2 && g_launchControl->mapIndex < 0 && panel == g_endlessConfig) {
+            int index = -1, count = 0;
+            auto* bytes = static_cast<unsigned char*>(panel);
+            if (!safeRead(bytes + 0x110, index) || !safeRead(bytes + 0x100, count) ||
+                index < 0 || index >= count || count > 64) return;
+            g_selectedMapIndex = index;
+            InterlockedExchange(&g_launchControl->mapIndex, index);
+            g_launchStage = 3;
+            InterlockedExchange(&g_launchControl->state, frostlaunch::prepared);
+            logLine(L"Host confirmed selected map; waiting for client preparation.");
+        }
+        return;
+    }
+    g_originalEndlessStart(panel, event);
+}
+
 void advanceEndlessLaunch() {
     if (!g_launchControl) return;
     __try {
@@ -1412,13 +1460,29 @@ void advanceEndlessLaunch() {
         if (state == frostlaunch::prepared || state == frostlaunch::dispatched ||
             state == frostlaunch::failed) return;
         if (state == frostlaunch::commitRequested) {
+            if (g_launchStage == 4) {
+                if (g_sessionLoaded) {
+                    InterlockedExchange(&g_launchControl->state, frostlaunch::dispatched);
+                    logLine(L"Endless launch: city load confirmed.");
+                } else if (GetTickCount64() > g_launchDeadline) {
+                    InterlockedExchange(&g_launchControl->state, frostlaunch::failed);
+                    logLine(L"Endless launch: native callback did not load a city.");
+                }
+                return;
+            }
             if (g_launchStage != 3 || !g_endlessConfig) {
                 InterlockedExchange(&g_launchControl->state, frostlaunch::failed);
                 return;
             }
             g_launchStage = 4; // exactly once, including reentrant callbacks
-            reinterpret_cast<MenuPanelCallback>(g_gameBase + 0x1A8ADE0)(g_endlessConfig, nullptr);
-            InterlockedExchange(&g_launchControl->state, frostlaunch::dispatched);
+            int actual = -1;
+            if (!safeRead(static_cast<unsigned char*>(g_endlessConfig) + 0x110, actual) ||
+                actual != g_selectedMapIndex) {
+                InterlockedExchange(&g_launchControl->state, frostlaunch::failed);
+                return;
+            }
+            g_originalEndlessStart(g_endlessConfig, nullptr);
+            g_launchDeadline = GetTickCount64() + 90000;
             logLine(L"Endless launch: synchronized native start callback dispatched.");
             return;
         }
@@ -1432,7 +1496,7 @@ void advanceEndlessLaunch() {
             g_nextMapIndex = 0;
             g_selectedMapIndex = -1;
             g_mapSelectionIssued = false;
-            g_launchDeadline = GetTickCount64() + 20000;
+            g_launchDeadline = GetTickCount64() + 600000;
             g_multiplayerMode.store(false);
             restoreConnectionButtons();
             g_connectionPanel.store(nullptr);
@@ -1464,6 +1528,7 @@ void advanceEndlessLaunch() {
                 !safeRead(panel + 0x100, count) || !safeRead(panel + 0x110, index) ||
                 index < 0 || index >= count) return;
             LONG requestedMap = InterlockedCompareExchange(&g_launchControl->mapIndex, 0, 0);
+            if (requestedMap < 0) return; // host chooses and confirms via native Start
             if (count > 64 || (requestedMap >= 0 && requestedMap >= count) ||
                 (requestedMap < 0 && g_nextMapIndex >= count)) {
                 InterlockedExchange(&g_launchControl->state, frostlaunch::failed);
@@ -1480,6 +1545,7 @@ void advanceEndlessLaunch() {
                 g_mapSelectionIssued = true;
                 return; // let the native panel refresh Start enabled state
             }
+            if (index != g_selectedMapIndex) { g_mapSelectionIssued = false; return; }
             void* root = panelElement(g_endlessConfig, kPanelRootOffset);
             void* start = root ? findElement(root, "START_BUTTON") : nullptr;
             std::uint32_t flags = 0;
@@ -1529,6 +1595,9 @@ bool installHooks() {
     if (!g_endlessShowHook.install(reinterpret_cast<void*>(g_gameBase + 0x1A89900),
             reinterpret_cast<void*>(endlessShowHook), prologue, sizeof(prologue))) return false;
     g_originalEndlessShow = g_endlessShowHook.original<MainMenuUpdate>();
+    if (!g_endlessStartHook.install(reinterpret_cast<void*>(g_gameBase + 0x1A8ADE0),
+            reinterpret_cast<void*>(endlessStartHook), prologue, sizeof(prologue))) return false;
+    g_originalEndlessStart = g_endlessStartHook.original<MenuPanelCallback>();
     auto* updateTarget = reinterpret_cast<void*>(g_gameBase + kMainMenuUpdateRva);
     auto* bindButtonsTarget = reinterpret_cast<void*>(g_gameBase + kMainMenuBindButtonsRva);
     auto* callbackTarget = reinterpret_cast<void*>(g_gameBase + kMenuPanelCallbackRva);
@@ -1665,6 +1734,7 @@ DWORD WINAPI workerThread(void*) {
     // The panels can already be open when the DLL is injected. Hooks handle all
     // later updates; this worker supplies a persistent attach-time fallback.
     logLine(L"Waiting for Frostpunk main-menu panels.");
+    ULONGLONG nextMaintenance = 0;
     for (;;) {
         if (!g_messageHook) {
             if (HWND window = findGameWindow()) {
@@ -1673,6 +1743,8 @@ DWORD WINAPI workerThread(void*) {
             }
         }
         if (g_messageHook && g_launchMessage) PostThreadMessageW(g_uiThread, g_launchMessage, 0, 0);
+        if (GetTickCount64() < nextMaintenance) { Sleep(10); continue; }
+        nextMaintenance = GetTickCount64() + 250;
         // Some fullscreen SDL configurations coalesce or suppress popup-window
         // timers. Drive both overlay windows from this persistent fallback too.
         if (g_overlayButtonWindow) PostMessageW(g_overlayButtonWindow, WM_TIMER, 1, 0);
@@ -1695,7 +1767,7 @@ DWORD WINAPI workerThread(void*) {
             // projection so only the Steam row remains visible.
             if (panel) configureConnectionPanel(panel);
         }
-        Sleep(250);
+        Sleep(10);
     }
 }
 
