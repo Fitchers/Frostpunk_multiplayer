@@ -34,7 +34,7 @@
 namespace {
 
 constexpr std::uint32_t kProtocolMagic = 0x31504246;  // "FBP1"
-constexpr std::uint16_t kProtocolVersion = 10;
+constexpr std::uint16_t kProtocolVersion = 11;
 constexpr int kChannel = 17;
 constexpr int kSendUnreliable = 0;
 constexpr int kSendReliable = 2;
@@ -1341,8 +1341,11 @@ private:
         if (connected_ && localState.available && localState.loaded) {
             const bool fresh = peerSession_ && now - peerSessionReceived_ < std::chrono::seconds(2);
             const bool waiting = !fresh || !peerSession_->loaded;
-            const bool hold = waiting || frostsync::holdAhead(localState.gameTimeMs,
-                peerSession_->gameTimeMs, clockHold_);
+            if (waiting) clockCorrection_.reset();
+            const auto wallMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now.time_since_epoch()).count();
+            const bool hold = waiting || clockCorrection_.update(localState.gameTimeMs,
+                peerSession_->gameTimeMs, wallMs, gameSession_.localPause() || peerPauseRequested_);
             gameSession_.commandPause(hold || peerPauseRequested_);
             if (hold != clockHold_) {
                 clockHold_ = hold;
@@ -1749,6 +1752,7 @@ private:
     std::optional<SessionStatePayload> peerSession_;
     std::chrono::steady_clock::time_point peerSessionReceived_{};
     bool clockHold_ = false;
+    frostsync::ClockCorrection clockCorrection_;
     bool clockWaitReported_ = false;
     bool sessionBarrierReleased_ = false;
     bool skewReported_ = false;

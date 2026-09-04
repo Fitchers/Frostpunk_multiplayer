@@ -8,6 +8,21 @@ Read-only analysis of both live processes on 2026-09-04. Heap addresses are not 
 
 ### Update 2026-09-05: timer reasons and continuous correction
 
+Anti-stutter follow-up (protocol 11): live IPC counted 20 and 19 pause-command
+changes per two seconds in PIDs 11916/13072 with localPause=0. The old 3000 ms
+threshold was below the observed 4800 ms calendar quantum. ClockCorrection now
+ignores <=15000 ms drift, requires 750 ms of continuous excess drift, and releases
+at <=5000 ms. User/UI and unloaded/stale-peer holds bypass that filter. This is
+a deliberate accuracy/smoothness tradeoff, not a promise of a 3-second bound.
+Tests cover 10000 frame-jitter samples, transient spikes, leader reversal,
+user-pause interaction and real LAN IPC with zero jitter-induced commands.
+The protocol-10 measurements below document the superseded controller.
+After deploying protocol 11 to both bridges without restarting the games,
+40 live samples at 250 ms intervals recorded zero pause-command changes in
+each process, equal calendar advance of 1473600 ms, and 0–9600 ms skew.
+Both local-pause flags remained zero. This verifies removal of pause chatter;
+it is not an FPS benchmark or a strict bound on future network jitter.
+
 Current implementation supersedes the UserPause-only prototype described below.
 GameplayTimer pointer RVA `0x2B68510`, vtable `0x1D716F0`, reason array `+0xB8`,
 count `+0xC0`. Native add/remove reason functions: `0xF6C530` / `0xF6CA80`.

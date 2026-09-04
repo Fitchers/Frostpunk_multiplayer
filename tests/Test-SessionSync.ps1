@@ -84,9 +84,20 @@ try {
  $views[1].Write(32,[int]0); $views[1].Write(28,[int]3)
  Wait-Until { $views[0].ReadInt32(40) -eq 0 } 'peer releases UI pause after catchup'
 
+ # Normal one/two-frame jitter must not produce network pause chatter.
+ $beforeJitterHost=$views[0].ReadInt32(36); $beforeJitterGuest=$views[1].ReadInt32(36)
+ foreach($i in 1..40) {
+  $views[0].Write(48,[int64](35000000 + $i*14400))
+  $views[1].Write(48,[int64](35000000 + $i*14400 + ($i%3)*4800))
+  Start-Sleep -Milliseconds 25
+ }
+ if($views[0].ReadInt32(36) -ne $beforeJitterHost -or $views[1].ReadInt32(36) -ne $beforeJitterGuest) {
+  throw 'Frame jitter generated pause commands'
+ }
+
  foreach($child in $children) { $child.StandardInput.WriteLine('quit'); $child.StandardInput.Flush() }
  foreach($child in $children) { if(!$child.WaitForExit(5000)) { throw 'Bridge did not exit' } }
- 'PASS: bidirectional shared pause and loaded-city start barrier with <=3 second clock skew.'
+ 'PASS: shared pause, startup hold, bidirectional catchup and zero frame-jitter pause commands.'
 } finally {
  foreach($child in $children) { if(!$child.HasExited) { $child.Kill(); $child.WaitForExit() }; $child.Dispose() }
  foreach($view in $views) { $view.Dispose() }; foreach($map in $maps) { $map.Dispose() }
