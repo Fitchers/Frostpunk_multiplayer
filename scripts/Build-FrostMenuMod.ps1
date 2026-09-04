@@ -7,6 +7,7 @@ $ErrorActionPreference = 'Stop'
 $projectRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $modSource = Join-Path $projectRoot 'src\FrostMenuMod\FrostMenuMod.cpp'
 $injectorSource = Join-Path $projectRoot 'src\FrostMenuInjector\FrostMenuInjector.cpp'
+$launcherSource = Join-Path $projectRoot 'src\FrostpunkMultiplayerLauncher\FrostpunkMultiplayerLauncher.cpp'
 $outputDirectory = Join-Path $projectRoot 'bin'
 
 if ([string]::IsNullOrWhiteSpace($VisualStudioRoot)) {
@@ -34,8 +35,11 @@ $quotedModObject = '"/Fo:' + (Join-Path $outputDirectory 'FrostMenuMod.obj') + '
 $quotedInjectorSource = '"' + $injectorSource + '"'
 $quotedInjectorOutput = '"/Fe:' + (Join-Path $outputDirectory 'FrostMenuInjector.exe') + '"'
 $quotedInjectorObject = '"/Fo:' + (Join-Path $outputDirectory 'FrostMenuInjector.obj') + '"'
+$quotedLauncherSource = '"' + $launcherSource + '"'
+$quotedLauncherOutput = '"/Fe:' + (Join-Path $outputDirectory 'FrostpunkMultiplayerLauncher.exe') + '"'
+$quotedLauncherObject = '"/Fo:' + (Join-Path $outputDirectory 'FrostpunkMultiplayerLauncher.obj') + '"'
 $common = '/nologo /std:c++20 /EHsc /W4 /O2 /MT /utf-8'
-$command = "$quotedVcVars && cl.exe $common /LD $quotedModSource $quotedModOutput $quotedModObject user32.lib && cl.exe $common $quotedInjectorSource $quotedInjectorOutput $quotedInjectorObject bcrypt.lib"
+$command = "$quotedVcVars && cl.exe $common /LD $quotedModSource $quotedModOutput $quotedModObject user32.lib && cl.exe $common $quotedInjectorSource $quotedInjectorOutput $quotedInjectorObject bcrypt.lib && cl.exe $common $quotedLauncherSource $quotedLauncherOutput $quotedLauncherObject /link /SUBSYSTEM:WINDOWS bcrypt.lib shell32.lib user32.lib"
 
 & cmd.exe /d /s /c $command
 if ($LASTEXITCODE -ne 0) {
@@ -44,3 +48,4 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Host "Built: $(Join-Path $outputDirectory 'FrostMenuMod.dll')"
 Write-Host "Built: $(Join-Path $outputDirectory 'FrostMenuInjector.exe')"
+Write-Host "Built: $(Join-Path $outputDirectory 'FrostpunkMultiplayerLauncher.exe')"

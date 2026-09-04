@@ -217,9 +217,13 @@ void injectLibrary(DWORD processId, HANDLE process, const std::filesystem::path&
         VirtualFreeEx(process, remotePath, 0, MEM_RELEASE);
         fail("CreateRemoteThread failed: " + win32Error(GetLastError()));
     }
-    const DWORD wait = WaitForSingleObject(thread.value, 10000);
+    const DWORD wait = WaitForSingleObject(thread.value, 30000);
+    if (wait != WAIT_OBJECT_0) {
+        // The loader may still be reading the remote path. Never free it until
+        // the thread finishes; the process will reclaim it on exit if timed out.
+        fail("FrostMenuMod.dll loading did not finish within 30 seconds. Check the game before retrying.");
+    }
     VirtualFreeEx(process, remotePath, 0, MEM_RELEASE);
-    if (wait != WAIT_OBJECT_0) fail("Timed out while loading FrostMenuMod.dll.");
 
     Sleep(250);
     if (!remoteModuleLoaded(processId, dllPath)) {

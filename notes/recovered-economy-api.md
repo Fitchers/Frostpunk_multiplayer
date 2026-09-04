@@ -38,7 +38,7 @@ struct FrostpunkEconomyResourceRecord {
 }; // sizeof == 0x70
 ```
 
-Observed indices in the current scenario:
+Historical indices from ONE early city (not stable; do not use as resource IDs):
 
 | Index | Observed amount | Capacity | Identification |
 |---:|---:|---:|---|
@@ -48,8 +48,50 @@ Observed indices in the current scenario:
 | 8 | 20 | 300 | Steel |
 | 9 | 80 | 300 | likely raw food |
 
-Index identities should eventually be verified using each
-`FrostpunkResourceEntry` rather than assumed globally.
+### Stable resource identity (verified 2026-09-04)
+
+The array order changes between game processes and city loads. Fixed indices
+caused LAN telemetry to report other resources (including raw food as steam cores).
+`FrostBridgeNet` now resolves identity on every snapshot through the record's
+`FrostpunkResourceEntry*`, never by index, quantity, capacity or a cached address.
+
+Resource entry fields verified in both live processes:
+
+| Offset | Field |
+|---|---|
+| `+0x00` | Pointer to NUL-terminated ASCII internal Name |
+| `+0x08` | 16-byte GUID (observed; not required by the reader) |
+| `+0x28` | Pointer to localization key (not a translated name) |
+| `+0xC0` | Pointer to internal resource telemetry key |
+
+Both Name and telemetry key must agree:
+
+| Resource | Internal Name | Telemetry key | Index in PID 36096 | Index in PID 38208 |
+|---|---|---|---:|---:|
+| Coal | `Coal` | `res_coal` | 0 | 2 |
+| Wood | `Wood` | `res_wood` | 3 | 0 |
+| Steel | `Steel` | `res_steel` | 5 | 3 |
+| Steam cores | `Steam Cores` | `res_cores` | 8 | 5 |
+| Raw food | `Raw Food` | `res_food` | 6 | 10 |
+| Food rations | `Food Rations` | `res_food_rations` | 7 | 4 |
+
+Both paused cities read 50 / 30 / 20 / 3 / 80 / 0, matching the supplied game HUD.
+The production reader in `src/FrostBridgeNet/ResourceReader.h` bounds reads and
+record counts, rejects missing/duplicate/conflicting identities and checks for
+container replacement during sampling. Invalid/unloaded cities produce no
+snapshot, not fabricated zero values. This is a read-only best-effort sample,
+not an atomic simulation-thread snapshot. Offsets still target the build above;
+the vtable check alone is not a cryptographic executable-version check.
+
+`tests/ResourceReaderTests.cpp` covers all 720 six-resource permutations, 100
+shuffled full tables, identical/zero amounts, missing/duplicate resources,
+invalid/partial reads, reloads and stale-cache prevention. Optional arguments
+`PID MODULE_BASE` also exercise the production reader on a live process with
+`PROCESS_VM_READ` only.
+
+Warning: the old exploratory FrostProbe coal-writing path still relies on the
+historical layout; this telemetry fix does not make that mutation path safe for
+arbitrary cities.
 
 ## Resource mutation function
 
