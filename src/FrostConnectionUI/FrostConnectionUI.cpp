@@ -19,6 +19,10 @@ HWND g_window{};
 HFONT g_font{};
 bool g_steam=false;
 bool g_host=false, g_connected=false, g_startPending=false;
+std::wstring g_initialName;
+std::wstring g_initialAddress=L"127.0.0.1";
+std::wstring g_initialPort=L"27020";
+int g_autoAction=0; // 1 host, 2 join
 DWORD g_pid=0;
 HANDLE g_game{};
 std::unique_ptr<frostbridge::ConnectionSession> g_session;
@@ -126,11 +130,11 @@ LRESULT CALLBACK windowProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
         g_font=CreateFontW(-18,0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
         control(L"STATIC",g_steam?L"STEAM P2P":L"ЛОКАЛЬНАЯ СЕТЬ — прямое соединение",0,20,16,650,28);
         control(L"STATIC",L"Имя игрока",0,20,58,145,24);
-        control(L"EDIT",L"",kName,170,54,490,30,WS_TABSTOP|ES_AUTOHSCROLL);
+        control(L"EDIT",g_initialName.c_str(),kName,170,54,490,30,WS_TABSTOP|ES_AUTOHSCROLL);
         control(L"STATIC",g_steam?L"SteamID64 друга":L"Адрес хоста",0,20,100,145,24);
-        control(L"EDIT",g_steam?L"":L"127.0.0.1",kAddress,170,96,320,30,WS_TABSTOP|ES_AUTOHSCROLL);
+        control(L"EDIT",g_steam?L"":g_initialAddress.c_str(),kAddress,170,96,320,30,WS_TABSTOP|ES_AUTOHSCROLL);
         control(L"STATIC",L"Порт",0,504,100,45,24);
-        control(L"EDIT",L"27020",kPort,553,96,107,30,WS_TABSTOP|ES_NUMBER);
+        control(L"EDIT",g_initialPort.c_str(),kPort,553,96,107,30,WS_TABSTOP|ES_NUMBER);
         control(L"STATIC",g_steam?L"Оба игрока вводят SteamID64 друг друга. AppID 480.":L"На одном ПК: 127.0.0.1. На другом ПК: локальный IPv4 хоста.",0,20,140,650,24);
         control(L"BUTTON",L"Создать",kHost,20,177,180,34,WS_TABSTOP);
         control(L"BUTTON",L"Подключиться",kJoin,217,177,220,34,WS_TABSTOP);
@@ -145,7 +149,10 @@ LRESULT CALLBACK windowProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
         SendDlgItemMessageW(window,kAddress,EM_SETLIMITTEXT,253,0);
         SendDlgItemMessageW(window,kPort,EM_SETLIMITTEXT,5,0);
         SendDlgItemMessageW(window,kChat,EM_SETLIMITTEXT,500,0);
-        controls(false); SetTimer(window,1,100,nullptr); return 0;
+        controls(false); SetTimer(window,1,100,nullptr);
+        if(g_autoAction) PostMessageW(window,WM_COMMAND,
+            MAKEWPARAM(g_autoAction==1?kHost:kJoin,BN_CLICKED),0);
+        return 0;
     case WM_COMMAND:
         if(HIWORD(wp)!=BN_CLICKED) break;
         try {
@@ -197,14 +204,20 @@ int frostbridge::runConnectionUI(const std::vector<std::wstring>& args) {
         for(std::size_t i=0;i<args.size();++i) {
             if(args[i]==L"--steam") g_steam=true;
             else if(args[i]==L"--lan") g_steam=false;
+            else if(args[i]==L"--name"&&i+1<args.size()) g_initialName=args[++i];
+            else if(args[i]==L"--address"&&i+1<args.size()) g_initialAddress=args[++i];
+            else if(args[i]==L"--port"&&i+1<args.size()) g_initialPort=args[++i];
+            else if(args[i]==L"--auto-host") g_autoAction=1;
+            else if(args[i]==L"--auto-join") g_autoAction=2;
             else if(args[i]==L"--pid"&&i+1<args.size()) {
                 const auto value=args[++i];
                 if(value.empty()||value.find_first_not_of(L"0123456789")!=std::wstring::npos) throw std::runtime_error("Некорректный PID.");
                 auto pid=std::stoull(value);
                 if(!pid||pid>MAXDWORD) throw std::runtime_error("Некорректный PID.");
                 g_pid=static_cast<DWORD>(pid);
-            } else throw std::runtime_error("Параметры: [--lan | --steam] [--pid PID]");
+            } else throw std::runtime_error("Параметры: [--lan | --steam] [--pid PID] [--name NAME] [--address IP] [--port PORT] [--auto-host | --auto-join]");
         }
+        if(g_autoAction&&g_initialName.empty()) throw std::runtime_error("Для автоматического подключения укажите --name.");
         const auto title=std::wstring(L"FrostBridge — ")+(g_steam?L"Steam":L"LAN")+L" — PID "+std::to_wstring(g_pid);
         // One UI/bridge per city, including when called again from the menu.
         const auto mutexName=L"Local\\FrostBridgeUI-"+std::to_wstring(g_pid);

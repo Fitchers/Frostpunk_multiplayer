@@ -7,6 +7,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace frostbridge::resources {
 
@@ -21,6 +22,11 @@ inline constexpr std::size_t maxRecords = 64;
 
 struct Snapshot {
     std::int32_t coal, wood, steel, steamCores, rawFood, foodRations;
+};
+
+struct Resolved {
+    Snapshot snapshot{};
+    std::array<std::uintptr_t, 6> entries{};
 };
 
 template<class T, class Reader>
@@ -52,7 +58,7 @@ std::optional<std::string> text(Reader& read, std::uintptr_t address) {
 // Reader has signature bool(uintptr_t address, void* destination, size_t bytes).
 // No game writes, amount-based guesses, or cached pointers/indices across ticks.
 template<class Reader>
-std::optional<Snapshot> readSnapshot(Reader read, std::uintptr_t moduleBase) {
+std::optional<Resolved> readResolved(Reader read, std::uintptr_t moduleBase) {
     const auto economy = value<std::uintptr_t>(read, moduleBase + economyRva);
     if (!economy || !pointer(*economy)) return std::nullopt;
     if (value<std::uintptr_t>(read, *economy) != moduleBase + economyVtableRva)
@@ -69,6 +75,7 @@ std::optional<Snapshot> readSnapshot(Reader read, std::uintptr_t moduleBase) {
     constexpr std::array<std::string_view, 6> keys{
         "res_coal", "res_wood", "res_steel", "res_cores", "res_food", "res_food_rations"};
     std::array<std::optional<std::int32_t>, 6> amounts{};
+    std::array<std::uintptr_t, 6> entries{};
     for (std::size_t i = 0; i < *count; ++i) {
         std::uintptr_t entry = 0;
         std::int32_t amount = 0;
@@ -88,6 +95,7 @@ std::optional<Snapshot> readSnapshot(Reader read, std::uintptr_t moduleBase) {
             if (*name != names[kind] || *key != keys[kind] || amounts[kind] || amount < 0)
                 return std::nullopt;
             amounts[kind] = amount;
+            entries[kind] = entry;
         }
         // Reject a record replaced while its identity was being read.
         if (value<std::uintptr_t>(read, *records + i * recordSize) != entry)
@@ -99,7 +107,15 @@ std::optional<Snapshot> readSnapshot(Reader read, std::uintptr_t moduleBase) {
         value<std::uint32_t>(read, *economy + countOffset) != count)
         return std::nullopt;
     for (const auto& amount : amounts) if (!amount) return std::nullopt;
-    return Snapshot{*amounts[0], *amounts[1], *amounts[2], *amounts[3], *amounts[4], *amounts[5]};
+    return Resolved{
+        Snapshot{*amounts[0], *amounts[1], *amounts[2], *amounts[3], *amounts[4], *amounts[5]},
+        entries};
+}
+
+template<class Reader>
+std::optional<Snapshot> readSnapshot(Reader read, std::uintptr_t moduleBase) {
+    const auto resolved = readResolved(std::move(read), moduleBase);
+    return resolved ? std::optional<Snapshot>(resolved->snapshot) : std::nullopt;
 }
 
 } // namespace frostbridge::resources

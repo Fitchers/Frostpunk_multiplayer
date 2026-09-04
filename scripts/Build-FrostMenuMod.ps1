@@ -1,6 +1,8 @@
 [CmdletBinding()]
 param(
-    [string]$VisualStudioRoot
+    [string]$VisualStudioRoot,
+    [string]$OutputDirectory,
+    [switch]$ModOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -8,7 +10,10 @@ $projectRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $modSource = Join-Path $projectRoot 'src\FrostMenuMod\FrostMenuMod.cpp'
 $injectorSource = Join-Path $projectRoot 'src\FrostMenuInjector\FrostMenuInjector.cpp'
 $launcherSource = Join-Path $projectRoot 'src\FrostpunkMultiplayerLauncher\FrostpunkMultiplayerLauncher.cpp'
-$outputDirectory = Join-Path $projectRoot 'bin'
+if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
+    $OutputDirectory = Join-Path $projectRoot 'bin'
+}
+$outputDirectory = [System.IO.Path]::GetFullPath($OutputDirectory)
 
 if ([string]::IsNullOrWhiteSpace($VisualStudioRoot)) {
     $vsWhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
@@ -39,7 +44,10 @@ $quotedLauncherSource = '"' + $launcherSource + '"'
 $quotedLauncherOutput = '"/Fe:' + (Join-Path $outputDirectory 'FrostpunkMultiplayerLauncher.exe') + '"'
 $quotedLauncherObject = '"/Fo:' + (Join-Path $outputDirectory 'FrostpunkMultiplayerLauncher.obj') + '"'
 $common = '/nologo /std:c++20 /EHsc /W4 /O2 /MT /utf-8'
-$command = "$quotedVcVars && cl.exe $common /LD $quotedModSource $quotedModOutput $quotedModObject user32.lib && cl.exe $common $quotedInjectorSource $quotedInjectorOutput $quotedInjectorObject bcrypt.lib && cl.exe $common $quotedLauncherSource $quotedLauncherOutput $quotedLauncherObject /link /SUBSYSTEM:WINDOWS bcrypt.lib shell32.lib user32.lib"
+$command = "$quotedVcVars && cl.exe $common /LD $quotedModSource $quotedModOutput $quotedModObject user32.lib gdi32.lib comctl32.lib"
+if (!$ModOnly) {
+    $command += " && cl.exe $common $quotedInjectorSource $quotedInjectorOutput $quotedInjectorObject bcrypt.lib && cl.exe $common $quotedLauncherSource $quotedLauncherOutput $quotedLauncherObject /link /SUBSYSTEM:WINDOWS bcrypt.lib shell32.lib user32.lib"
+}
 
 & cmd.exe /d /s /c $command
 if ($LASTEXITCODE -ne 0) {
@@ -47,5 +55,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Host "Built: $(Join-Path $outputDirectory 'FrostMenuMod.dll')"
-Write-Host "Built: $(Join-Path $outputDirectory 'FrostMenuInjector.exe')"
-Write-Host "Built: $(Join-Path $outputDirectory 'FrostpunkMultiplayerLauncher.exe')"
+if (!$ModOnly) {
+    Write-Host "Built: $(Join-Path $outputDirectory 'FrostMenuInjector.exe')"
+    Write-Host "Built: $(Join-Path $outputDirectory 'FrostpunkMultiplayerLauncher.exe')"
+}

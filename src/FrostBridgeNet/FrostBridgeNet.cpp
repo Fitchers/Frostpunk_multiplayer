@@ -25,12 +25,15 @@
 #include <functional>
 #include "ConnectionSession.h"
 #include "ResourceReader.h"
+#include "CityVitals.h"
 #include "../LaunchControl.h"
+#include "../OverlayControl.h"
+#include "../SessionControl.h"
 
 namespace {
 
 constexpr std::uint32_t kProtocolMagic = 0x31504246;  // "FBP1"
-constexpr std::uint16_t kProtocolVersion = 4;
+constexpr std::uint16_t kProtocolVersion = 8;
 constexpr int kChannel = 17;
 constexpr int kSendUnreliable = 0;
 constexpr int kSendReliable = 2;
@@ -48,6 +51,11 @@ enum class MessageType : std::uint16_t {
     startReady = 7,
     startCommit = 8,
     startResult = 9,
+    transferRequest = 10,
+    transferResult = 11,
+    pauseState = 12,
+    sessionState = 13,
+    startGo = 14,
 };
 
 #pragma pack(push, 1)
@@ -69,7 +77,36 @@ struct HelloPayload {
 struct HeartbeatPayload {
     std::uint64_t uptimeMs = 0;
 };
-struct StartPayload { std::uint32_t request; std::int32_t status; };
+struct StartPayload {
+    std::uint32_t request = 0;
+    std::int32_t status = 0;
+    std::int32_t mapIndex = -1;
+};
+
+struct TransferRequestPayload {
+    std::uint32_t id = 0;
+    std::int32_t resource = 0;
+    std::int32_t amount = 0;
+};
+
+struct TransferResultPayload {
+    std::uint32_t id = 0;
+    std::int32_t status = 0;
+    std::int32_t applied = 0;
+};
+
+struct PausePayload {
+    std::uint32_t request = 0;
+    std::int32_t paused = 1;
+    std::uint32_t delayMs = 0;
+};
+
+struct SessionStatePayload {
+    std::uint32_t request = 0;
+    std::int32_t loaded = 0;
+    std::int32_t paused = 1;
+    std::int64_t gameTimeMs = 0;
+};
 
 struct CitySnapshotPayload {
     std::int32_t coal = 0;
@@ -80,11 +117,13 @@ struct CitySnapshotPayload {
     std::int32_t foodRations = 0;
     std::int32_t population = 0;
     std::int32_t temperature = 0;
+    std::int32_t hope = -1;
+    std::int32_t discontent = -1;
 };
 #pragma pack(pop)
 
 static_assert(sizeof(PacketHeader) == 32);
-static_assert(sizeof(CitySnapshotPayload) == 32);
+static_assert(sizeof(CitySnapshotPayload) == 40);
 
 [[noreturn]] void fail(const std::string& message) {
     throw std::runtime_error(message);
@@ -203,6 +242,14 @@ std::optional<CitySnapshotPayload> readLocalCity(DWORD selectedProcessId) {
     if (!resources) return std::nullopt;
 
     CitySnapshotPayload city{};
+    const auto vitals = frostbridge::vitals::readSnapshot(
+        [&](std::uintptr_t address, void* destination, std::size_t size) {
+            SIZE_T bytesRead = 0;
+            return ReadProcessMemory(process.value, reinterpret_cast<const void*>(address),
+                destination, size, &bytesRead) && bytesRead == size;
+        }, *moduleBase);
+    city.hope = vitals.hope;
+    city.discontent = vitals.discontent;
     city.coal = resources->coal;
     city.wood = resources->wood;
     city.steel = resources->steel;
@@ -213,6 +260,218 @@ std::optional<CitySnapshotPayload> readLocalCity(DWORD selectedProcessId) {
     city.temperature = -1; // Not recovered yet.
     return city;
 }
+
+class OverlayBridge {
+public:
+    OverlayBridge() = default;
+    OverlayBridge(const OverlayBridge&) = delete;
+    OverlayBridge& operator=(const OverlayBridge&) = delete;
+    ~OverlayBridge() { close(); }
+
+    void open(DWORD processId, const std::string& localName) {
+        close();
+        if (!processId) return;
+        mapping_ = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
+            0, sizeof(frostoverlay::Control), frostoverlay::name(processId).c_str());
+        if (!mapping_) return;
+        const bool created = GetLastError() != ERROR_ALREADY_EXISTS;
+        control_ = static_cast<frostoverlay::Control*>(MapViewOfFile(
+            mapping_, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(frostoverlay::Control)));
+        if (!control_) { CloseHandle(mapping_); mapping_ = nullptr; return; }
+        if (created) {
+            ZeroMemory(control_, sizeof(*control_));
+            control_->localHope = control_->localDiscontent = -1;
+            control_->peerHope = control_->peerDiscontent = -1;
+            control_->layoutVersion = frostoverlay::version;
+            MemoryBarrier();
+            control_->signature = frostoverlay::magic;
+        }
+        if (control_->signature != frostoverlay::magic ||
+            control_->layoutVersion != frostoverlay::version) {
+            close();
+            return;
+        }
+        writeNames(localName, "");
+        InterlockedExchange(&control_->connection,
+            static_cast<LONG>(frostoverlay::Connection::offline));
+        InterlockedExchange(&control_->transferBusy, 0);
+        lastOutgoing_ = InterlockedCompareExchange(&control_->outgoingSequence, 0, 0);
+    }
+
+    void close() {
+        if (control_) {
+            InterlockedExchange(&control_->connection,
+                static_cast<LONG>(frostoverlay::Connection::offline));
+            InterlockedExchange(&control_->transferBusy, 0);
+            UnmapViewOfFile(control_);
+        }
+        if (mapping_) CloseHandle(mapping_);
+        control_ = nullptr;
+        mapping_ = nullptr;
+    }
+
+    bool available() const { return control_ != nullptr; }
+
+    void connected(const std::string& localName, const std::string& peerName) {
+        if (!control_) return;
+        writeNames(localName, peerName);
+        InterlockedExchange(&control_->connection,
+            static_cast<LONG>(frostoverlay::Connection::connected));
+    }
+
+    void local(const CitySnapshotPayload& city) {
+        if (!control_) return;
+        write(&control_->local, city);
+        InterlockedExchange(&control_->localHope, city.hope);
+        InterlockedExchange(&control_->localDiscontent, city.discontent);
+    }
+    void peer(const CitySnapshotPayload& city) {
+        if (!control_) return;
+        write(&control_->peer, city);
+        InterlockedExchange(&control_->peerHope, city.hope);
+        InterlockedExchange(&control_->peerDiscontent, city.discontent);
+    }
+
+    struct Request { LONG resource; LONG amount; };
+    std::optional<Request> outgoing() {
+        if (!control_) return std::nullopt;
+        const LONG sequence = InterlockedCompareExchange(&control_->outgoingSequence, 0, 0);
+        if (sequence == lastOutgoing_) return std::nullopt;
+        MemoryBarrier();
+        lastOutgoing_ = sequence;
+        return Request{control_->outgoingResource, control_->outgoingAmount};
+    }
+
+    LONG apply(LONG resource, LONG delta) {
+        if (!control_ || !InterlockedCompareExchange(&control_->modReady, 0, 0) ||
+            !frostoverlay::validResource(resource) || !delta) return 0;
+        control_->applyResource = resource;
+        control_->applyDelta = delta;
+        MemoryBarrier();
+        return InterlockedIncrement(&control_->applyRequestSequence);
+    }
+
+    std::optional<LONG> applied(LONG sequence) const {
+        if (!control_ || !sequence ||
+            InterlockedCompareExchange(&control_->applyResultSequence, 0, 0) != sequence)
+            return std::nullopt;
+        MemoryBarrier();
+        return control_->applyResult;
+    }
+
+    void notify(const std::string& utf8) {
+        if (!control_) return;
+        wchar_t text[160]{};
+        MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, text,
+                            static_cast<int>(std::size(text)));
+        wcsncpy_s(control_->notification, text, _TRUNCATE);
+        MemoryBarrier();
+        InterlockedIncrement(&control_->notificationSequence);
+    }
+
+    void busy(bool value) {
+        if (control_) InterlockedExchange(&control_->transferBusy, value ? 1 : 0);
+    }
+
+private:
+    static void copy(char (&target)[64], const std::string& text) {
+        ZeroMemory(target, sizeof(target));
+        std::memcpy(target, text.data(), (std::min)(text.size(), sizeof(target) - 1));
+    }
+    void writeNames(const std::string& localName, const std::string& peerName) {
+        InterlockedIncrement(&control_->namesSequence);
+        MemoryBarrier();
+        copy(control_->localName, localName);
+        copy(control_->peerName, peerName);
+        MemoryBarrier();
+        InterlockedIncrement(&control_->namesSequence);
+    }
+    static void write(frostoverlay::Snapshot* target, const CitySnapshotPayload& city) {
+        if (!target) return;
+        frostoverlay::Values values{{city.coal, city.wood, city.steel,
+            city.steamCores, city.rawFood, city.foodRations}};
+        frostoverlay::writeSnapshot(*target, values);
+    }
+    HANDLE mapping_ = nullptr;
+    frostoverlay::Control* control_ = nullptr;
+    LONG lastOutgoing_ = 0;
+};
+
+class GameSessionBridge {
+public:
+    struct State {
+        bool available = false;
+        bool loaded = false;
+        bool paused = true;
+        LONG64 gameTimeMs = 0;
+        LONG generation = 0;
+    };
+
+    ~GameSessionBridge() { close(); }
+    void open(DWORD processId) {
+        close();
+        if (!processId) return;
+        mapping_ = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
+            0, sizeof(frostsession::Control), frostsession::name(processId).c_str());
+        if (!mapping_) return;
+        const bool created = GetLastError() != ERROR_ALREADY_EXISTS;
+        control_ = static_cast<frostsession::Control*>(MapViewOfFile(
+            mapping_, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(frostsession::Control)));
+        if (!control_) { CloseHandle(mapping_); mapping_ = nullptr; return; }
+        if (created) {
+            ZeroMemory(control_, sizeof(*control_));
+            control_->layoutVersion = frostsession::version;
+            control_->paused = 1;
+            control_->localPauseValue = 1;
+            control_->pauseCommandValue = 1;
+            MemoryBarrier();
+            control_->signature = frostsession::magic;
+        }
+        if (control_->signature != frostsession::magic ||
+            control_->layoutVersion != frostsession::version) {
+            close();
+            return;
+        }
+        lastPauseEvent_ = InterlockedCompareExchange(
+            &control_->localPauseSequence, 0, 0);
+    }
+    void close() {
+        if (control_) UnmapViewOfFile(control_);
+        if (mapping_) CloseHandle(mapping_);
+        control_ = nullptr;
+        mapping_ = nullptr;
+    }
+    State state() const {
+        if (!control_ || !InterlockedCompareExchange(&control_->modReady, 0, 0)) return {};
+        State result{};
+        result.available = true;
+        result.loaded = InterlockedCompareExchange(&control_->gameLoaded, 0, 0) != 0;
+        result.paused = InterlockedCompareExchange(&control_->paused, 0, 0) != 0;
+        result.gameTimeMs = InterlockedCompareExchange64(&control_->gameTimeMs, 0, 0);
+        result.generation = InterlockedCompareExchange(&control_->loadGeneration, 0, 0);
+        return result;
+    }
+    std::optional<bool> localPauseEvent() {
+        if (!control_) return std::nullopt;
+        const LONG sequence = InterlockedCompareExchange(
+            &control_->localPauseSequence, 0, 0);
+        if (sequence == lastPauseEvent_) return std::nullopt;
+        lastPauseEvent_ = sequence;
+        MemoryBarrier();
+        return control_->localPauseValue != 0;
+    }
+    LONG commandPause(bool paused) {
+        if (!control_ || !InterlockedCompareExchange(&control_->modReady, 0, 0)) return 0;
+        InterlockedExchange(&control_->pauseCommandValue, paused ? 1 : 0);
+        MemoryBarrier();
+        return InterlockedIncrement(&control_->pauseCommandSequence);
+    }
+
+private:
+    HANDLE mapping_ = nullptr;
+    frostsession::Control* control_ = nullptr;
+    LONG lastPauseEvent_ = 0;
+};
 
 class SteamApi {
 public:
@@ -711,7 +970,12 @@ public:
           playerName_(std::move(playerName)), cityName_(std::move(cityName)),
           watchFrostpunk_(watchFrostpunk),
           frostpunkProcessId_(frostpunkProcessId), host_(host),
-          started_(std::chrono::steady_clock::now()), output_(std::move(output)) {}
+          started_(std::chrono::steady_clock::now()), output_(std::move(output)) {
+        overlay_.open(frostpunkProcessId_, playerName_);
+        gameSession_.open(frostpunkProcessId_);
+        nextTransferId_ = static_cast<std::uint32_t>(timestampMs()) ^
+                          static_cast<std::uint32_t>(local_);
+    }
 
     void enqueue(std::string line) {
         std::lock_guard lock(queueMutex_);
@@ -750,7 +1014,43 @@ public:
     }
 
 private:
-    LONG localLaunch(bool request = false) {
+    enum class TransferStage { none, debit, awaitingPeer, refund };
+    struct OutgoingTransfer {
+        TransferStage stage = TransferStage::none;
+        std::uint32_t id = 0;
+        LONG resource = 0;
+        LONG amount = 0;
+        LONG applySequence = 0;
+        LONG refundAmount = 0;
+        int retries = 0;
+        std::chrono::steady_clock::time_point deadline{};
+    } outgoingTransfer_;
+    struct IncomingTransfer {
+        bool active = false;
+        TransferRequestPayload request{};
+        LONG applySequence = 0;
+    } incomingTransfer_;
+
+    struct LaunchState { LONG state = frostlaunch::unavailable; LONG mapIndex = -1; };
+    LaunchState localLaunch() {
+        if (!frostpunkProcessId_) return {};
+        WinHandle mapping(OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE,
+            frostlaunch::name(frostpunkProcessId_).c_str()));
+        if (!mapping) return {};
+        auto* control = static_cast<frostlaunch::Control*>(MapViewOfFile(
+            mapping.value, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(frostlaunch::Control)));
+        if (!control) return {};
+        LaunchState result{};
+        if (control->signature == frostlaunch::magic &&
+            control->layoutVersion == frostlaunch::version) {
+            result.state = InterlockedCompareExchange(&control->state, 0, 0);
+            result.mapIndex = InterlockedCompareExchange(&control->mapIndex, 0, 0);
+        }
+        UnmapViewOfFile(control);
+        return result;
+    }
+
+    LONG requestLocalPrepare(LONG mapIndex) {
         if (!frostpunkProcessId_) return frostlaunch::unavailable;
         WinHandle mapping(OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE,
             frostlaunch::name(frostpunkProcessId_).c_str()));
@@ -759,11 +1059,32 @@ private:
             mapping.value, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(frostlaunch::Control)));
         if (!control) return frostlaunch::unavailable;
         LONG state = frostlaunch::unavailable;
-        if (control->signature == frostlaunch::magic) {
-            state = request ? InterlockedCompareExchange(&control->state,
-                frostlaunch::requested, frostlaunch::ready)
-                : InterlockedCompareExchange(&control->state, 0, 0);
-            if (request && state == frostlaunch::ready) state = frostlaunch::requested;
+        if (control->signature == frostlaunch::magic &&
+            control->layoutVersion == frostlaunch::version) {
+            control->mapIndex = mapIndex;
+            MemoryBarrier();
+            state = InterlockedCompareExchange(&control->state,
+                frostlaunch::prepareRequested, frostlaunch::ready);
+            if (state == frostlaunch::ready) state = frostlaunch::prepareRequested;
+        }
+        UnmapViewOfFile(control);
+        return state;
+    }
+
+    LONG requestLocalCommit() {
+        if (!frostpunkProcessId_) return frostlaunch::unavailable;
+        WinHandle mapping(OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE,
+            frostlaunch::name(frostpunkProcessId_).c_str()));
+        if (!mapping) return frostlaunch::unavailable;
+        auto* control = static_cast<frostlaunch::Control*>(MapViewOfFile(
+            mapping.value, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(frostlaunch::Control)));
+        if (!control) return frostlaunch::unavailable;
+        LONG state = frostlaunch::unavailable;
+        if (control->signature == frostlaunch::magic &&
+            control->layoutVersion == frostlaunch::version) {
+            state = InterlockedCompareExchange(&control->state,
+                frostlaunch::commitRequested, frostlaunch::prepared);
+            if (state == frostlaunch::prepared) state = frostlaunch::commitRequested;
         }
         UnmapViewOfFile(control);
         return state;
@@ -777,19 +1098,277 @@ private:
         print(text.str());
     }
 
-    void sendStart(MessageType type, std::uint32_t request, LONG state) {
-        sendPacket(makePacket(type, ++sequence_, local_, StartPayload{request, state}), true);
+    static const char* resourceName(LONG resource) {
+        constexpr const char* names[] = {
+            "угля", "древесины", "стали", "паровых ядер", "сырой еды", "пищевых пайков"};
+        return frostoverlay::validResource(resource) ? names[resource] : "неизвестного ресурса";
     }
 
-    void commitLocal() {
-        const LONG state = localLaunch(true);
-        startCommitted_ = true;
+    static LONG cityAmount(const CitySnapshotPayload& city, LONG resource) {
+        const LONG values[] = {city.coal, city.wood, city.steel,
+            city.steamCores, city.rawFood, city.foodRations};
+        return frostoverlay::validResource(resource) ? values[resource] : -1;
+    }
+
+    void sendTransferResult(const TransferResultPayload& result) {
+        sendPacket(makePacket(MessageType::transferResult, ++sequence_, local_, result), true);
+    }
+
+    void beginOverlayTransfer(LONG resource, LONG amount) {
+        if (!connected_ || outgoingTransfer_.stage != TransferStage::none ||
+            incomingTransfer_.active) {
+            overlay_.notify("Передача уже выполняется или соединение отсутствует.");
+            return;
+        }
+        if (!frostoverlay::validResource(resource) || !frostoverlay::validAmount(amount)) {
+            overlay_.notify("Отклонена некорректная команда передачи.");
+            return;
+        }
+        if (!lastLocalCity_ || cityAmount(*lastLocalCity_, resource) < amount) {
+            overlay_.notify(std::string("Недостаточно ") + resourceName(resource) + " для передачи.");
+            return;
+        }
+        const LONG applySequence = overlay_.apply(resource, -amount);
+        if (!applySequence) {
+            overlay_.notify("Игровой мод не готов изменить ресурс.");
+            return;
+        }
+        outgoingTransfer_ = {TransferStage::debit, ++nextTransferId_, resource,
+            amount, applySequence, 0, 0, std::chrono::steady_clock::now() + std::chrono::seconds(5)};
+        overlay_.notify(("Передача " + std::to_string(amount) + " ") + resourceName(resource) + "…");
+        overlay_.busy(true);
+    }
+
+    void receiveTransferRequest(const TransferRequestPayload& request) {
+        if (!request.id || !frostoverlay::validResource(request.resource) ||
+            !frostoverlay::validAmount(request.amount)) {
+            sendTransferResult({request.id, -1, 0});
+            return;
+        }
+        if (lastIncomingResult_.id == request.id) {
+            sendTransferResult(lastIncomingResult_); // idempotent retry; never apply twice
+            return;
+        }
+        if (incomingTransfer_.active || outgoingTransfer_.stage != TransferStage::none) {
+            sendTransferResult({request.id, -2, 0});
+            return;
+        }
+        const LONG sequence = overlay_.apply(request.resource, request.amount);
+        if (!sequence) {
+            sendTransferResult({request.id, -1, 0});
+            return;
+        }
+        incomingTransfer_ = {true, request, sequence};
+    }
+
+    void receiveTransferResult(const TransferResultPayload& result) {
+        if (outgoingTransfer_.stage != TransferStage::awaitingPeer ||
+            result.id != outgoingTransfer_.id) return;
+        if (result.status == 1 && result.applied == outgoingTransfer_.amount) {
+            const std::string message = "Отправлено " + std::to_string(outgoingTransfer_.amount) + " " +
+                std::string(resourceName(outgoingTransfer_.resource)) + " игроку " + peerName_ + ".";
+            print("[trade] " + message);
+            overlay_.notify(message);
+            overlay_.busy(false);
+            outgoingTransfer_ = {};
+            return;
+        }
+        // A receiver can hit storage capacity and accept only part of the credit.
+        // Never refund the already credited part: that would create resources.
+        if (result.applied < 0 || result.applied > outgoingTransfer_.amount) return;
+        outgoingTransfer_.refundAmount = outgoingTransfer_.amount - result.applied;
+        if (!outgoingTransfer_.refundAmount) {
+            overlay_.busy(false);
+            outgoingTransfer_ = {};
+            return;
+        }
+        outgoingTransfer_.applySequence = overlay_.apply(
+            outgoingTransfer_.resource, outgoingTransfer_.refundAmount);
+        outgoingTransfer_.stage = TransferStage::refund;
+        outgoingTransfer_.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    }
+
+    void pollOverlay(const std::chrono::steady_clock::time_point now) {
+        if (const auto request = overlay_.outgoing()) {
+            beginOverlayTransfer(request->resource, request->amount);
+        }
+
+        if (outgoingTransfer_.stage == TransferStage::debit) {
+            if (const auto applied = overlay_.applied(outgoingTransfer_.applySequence)) {
+                if (*applied == -outgoingTransfer_.amount) {
+                    const TransferRequestPayload packet{outgoingTransfer_.id,
+                        outgoingTransfer_.resource, outgoingTransfer_.amount};
+                    if (sendPacket(makePacket(MessageType::transferRequest,
+                                              ++sequence_, local_, packet), true)) {
+                        outgoingTransfer_.stage = TransferStage::awaitingPeer;
+                        outgoingTransfer_.deadline = now + std::chrono::seconds(2);
+                    } else {
+                        outgoingTransfer_.refundAmount = outgoingTransfer_.amount;
+                        outgoingTransfer_.applySequence = overlay_.apply(
+                            outgoingTransfer_.resource, outgoingTransfer_.refundAmount);
+                        outgoingTransfer_.stage = TransferStage::refund;
+                    }
+                } else {
+                    // If the engine clamped a debit, restore precisely what it removed.
+                    outgoingTransfer_.refundAmount = *applied < 0 ? -*applied : 0;
+                    if (outgoingTransfer_.refundAmount) {
+                        outgoingTransfer_.applySequence = overlay_.apply(
+                            outgoingTransfer_.resource, outgoingTransfer_.refundAmount);
+                        outgoingTransfer_.stage = TransferStage::refund;
+                    } else {
+                        overlay_.notify(std::string("Недостаточно ") +
+                            resourceName(outgoingTransfer_.resource) + " для передачи.");
+                        overlay_.busy(false);
+                        outgoingTransfer_ = {};
+                    }
+                }
+            } else if (now > outgoingTransfer_.deadline) {
+                overlay_.notify("Игра не подтвердила списание ресурса.");
+                overlay_.busy(false);
+                outgoingTransfer_ = {};
+            }
+        } else if (outgoingTransfer_.stage == TransferStage::awaitingPeer &&
+                   now > outgoingTransfer_.deadline) {
+            if (outgoingTransfer_.retries++ < 3) {
+                const TransferRequestPayload packet{outgoingTransfer_.id,
+                    outgoingTransfer_.resource, outgoingTransfer_.amount};
+                sendPacket(makePacket(MessageType::transferRequest, ++sequence_, local_, packet), true);
+                outgoingTransfer_.deadline = now + std::chrono::seconds(2);
+            } else {
+                // Do not refund an ambiguous acknowledged-over-the-network credit;
+                // that could duplicate resources. The repeated ID is safe to retry later.
+                overlay_.notify("Нет подтверждения передачи; автоматический возврат небезопасен.");
+                print("[trade] confirmation timeout; local debit kept to prevent duplication.");
+                overlay_.busy(false);
+                outgoingTransfer_ = {};
+            }
+        } else if (outgoingTransfer_.stage == TransferStage::refund) {
+            if (const auto applied = overlay_.applied(outgoingTransfer_.applySequence)) {
+                overlay_.notify(*applied == outgoingTransfer_.refundAmount
+                    ? "Непринятый ресурс возвращён отправителю."
+                    : "Ошибка возврата ресурса; проверьте город.");
+                overlay_.busy(false);
+                outgoingTransfer_ = {};
+            } else if (now > outgoingTransfer_.deadline) {
+                overlay_.notify("Игра не подтвердила возврат ресурса.");
+                overlay_.busy(false);
+                outgoingTransfer_ = {};
+            }
+        }
+
+        if (incomingTransfer_.active) {
+            if (const auto applied = overlay_.applied(incomingTransfer_.applySequence)) {
+                const bool success = *applied == incomingTransfer_.request.amount;
+                lastIncomingResult_ = {incomingTransfer_.request.id, success ? 1 : -1, *applied};
+                sendTransferResult(lastIncomingResult_);
+                if (success) {
+                    const std::string message = "Получено " + std::to_string(incomingTransfer_.request.amount) + " " +
+                        std::string(resourceName(incomingTransfer_.request.resource)) +
+                        " от игрока " + peerName_ + ".";
+                    print("[trade] " + message);
+                    overlay_.notify(message);
+                }
+                incomingTransfer_ = {};
+            }
+        }
+    }
+
+    void sendPause(bool paused, std::uint32_t request = 0, std::uint32_t delayMs = 0) {
+        const PausePayload payload{request, paused ? 1 : 0, delayMs};
+        sendPacket(makePacket(MessageType::pauseState, ++sequence_, local_, payload), true);
+    }
+
+    void receivePause(const PausePayload& pause) {
+        if (pause.paused != 0 && pause.paused != 1) return;
+        if (pause.request && pause.request != startRequest_) return;
+        const bool paused = pause.paused != 0;
+        if (pause.delayMs) {
+            if (pause.request && !paused) sessionBarrierReleased_ = true;
+            pendingPause_.active = true;
+            pendingPause_.paused = paused;
+            pendingPause_.deadline = std::chrono::steady_clock::now() +
+                std::chrono::milliseconds((std::min)(pause.delayMs, 5000u));
+        } else if (!(startCommitted_ && !sessionBarrierReleased_ && !paused)) {
+            gameSession_.commandPause(paused);
+        }
+        print(paused ? "[sync] второй игрок поставил общую паузу."
+                     : "[sync] второй игрок снял общую паузу.");
+    }
+
+    void receiveSessionState(const SessionStatePayload& state) {
+        if (state.loaded != 0 && state.loaded != 1) return;
+        if (state.paused != 0 && state.paused != 1) return;
+        if (state.gameTimeMs < 0) return;
+        peerSession_ = state;
+    }
+
+    void sendSessionState() {
+        const auto state = gameSession_.state();
+        if (!state.available) return;
+        const SessionStatePayload payload{startCommitted_ ? startRequest_ : 0,
+            state.loaded ? 1 : 0, state.paused ? 1 : 0, state.gameTimeMs};
+        sendPacket(makePacket(MessageType::sessionState, ++sequence_, local_, payload), false);
+    }
+
+    void pollGameSession(const std::chrono::steady_clock::time_point now) {
+        const auto localState = gameSession_.state();
+        if (pendingPause_.active && now >= pendingPause_.deadline) {
+            gameSession_.commandPause(pendingPause_.paused);
+            pendingPause_ = {};
+        }
+        if (const auto pause = gameSession_.localPauseEvent()) {
+            if (startCommitted_ && !sessionBarrierReleased_ && !*pause) {
+                gameSession_.commandPause(true);
+                print("[sync] стартовая пауза останется до загрузки второго города.");
+            } else if (connected_) {
+                sendPause(*pause);
+                print(*pause ? "[sync] общая пауза включена."
+                             : "[sync] общая пауза снята.");
+            }
+        }
+
+        // Hold each loaded city BEFORE checking whether the other city is loaded.
+        if (startCommitted_ && !sessionBarrierReleased_ && localState.available &&
+            localState.loaded && !localState.paused) gameSession_.commandPause(true);
+        if (!startCommitted_ || sessionBarrierReleased_ || !host_ ||
+            !localState.available || !localState.loaded || !localState.paused || !peerSession_ ||
+            peerSession_->request != startRequest_ || !peerSession_->loaded ||
+            !peerSession_->paused) return;
+        const LONG64 skew = localState.gameTimeMs > peerSession_->gameTimeMs
+            ? localState.gameTimeMs - peerSession_->gameTimeMs
+            : peerSession_->gameTimeMs - localState.gameTimeMs;
+        if (skew > frostsession::allowedStartSkewMs) {
+            if (!skewReported_) {
+                print("[sync] запуск удерживается: рассинхрон игрового времени больше 3 секунд.");
+                skewReported_ = true;
+            }
+            return;
+        }
+        constexpr std::uint32_t resumeDelayMs = 1500;
+        sendPause(false, startRequest_, resumeDelayMs);
+        pendingPause_ = {true, false, now + std::chrono::milliseconds(resumeDelayMs)};
+        sessionBarrierReleased_ = true;
+        print("[sync] оба города загружены; одновременный старт через 1,5 секунды.");
+    }
+
+    void sendStart(MessageType type, std::uint32_t request, LONG state, LONG mapIndex = -1) {
+        sendPacket(makePacket(type, ++sequence_, local_,
+                              StartPayload{request, state, mapIndex}), true);
+    }
+
+    void commitLocalPreparedMap() {
+        const LONG state = requestLocalCommit();
+        startCommitted_ = state == frostlaunch::commitRequested;
+        sessionBarrierReleased_ = false;
+        skewReported_ = false;
+        peerSession_.reset();
+        pendingPause_ = {};
         waitingStart_ = false;
         launchDeadline_ = std::chrono::steady_clock::now() + std::chrono::seconds(90);
-        print(state == frostlaunch::requested
-            ? "[game] launching: запускается бесконечный режим…"
+        print(state == frostlaunch::commitRequested
+            ? "[game] launching: синхронно запускается выбранная карта…"
             : "[game] failed: игра не готова к запуску. Вернитесь в меню подключения.");
-        if (state != frostlaunch::requested) {
+        if (state != frostlaunch::commitRequested) {
             launchReported_ = true;
             sendStart(MessageType::startResult, startRequest_, frostlaunch::failed);
         }
@@ -800,31 +1379,89 @@ private:
         if (type == MessageType::startPrepare && !host_) {
             if (startCommitted_ || start.request < startRequest_) return;
             startRequest_ = start.request;
-            const LONG state = localLaunch();
+            const LONG state = localLaunch().state;
             prepared_ = state == frostlaunch::ready;
             launchDeadline_ = std::chrono::steady_clock::now() + std::chrono::seconds(10);
             sendStart(MessageType::startReady, start.request, state);
         } else if (type == MessageType::startReady && host_ && waitingStart_ && start.request == startRequest_) {
             waitingStart_ = false;
-            if (start.status != frostlaunch::ready || localLaunch() != frostlaunch::ready) {
+            if (start.status != frostlaunch::ready || localLaunch().state != frostlaunch::ready) {
                 print("[game] rejected: оба игрока должны находиться в меню подключения с обновлённым модом.");
                 return;
             }
-            if (!sendPacket(makePacket(MessageType::startCommit, ++sequence_, local_,
-                                       StartPayload{startRequest_, 0}), true)) {
-                print("[game] rejected: не удалось передать команду клиенту.");
+            const LONG state = requestLocalPrepare(-1);
+            if (state != frostlaunch::prepareRequested) {
+                print("[game] rejected: хост не смог открыть выбор карты.");
                 return;
             }
-            commitLocal();
+            hostMapPreparing_ = true;
+            launchDeadline_ = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+            print("[game] host-map: хост подготавливает карту и её точный индекс.");
         } else if (type == MessageType::startCommit && !host_ && prepared_ &&
                    !startCommitted_ && start.request == startRequest_ &&
                    std::chrono::steady_clock::now() < launchDeadline_) {
             prepared_ = false;
-            commitLocal();
-        } else if (type == MessageType::startResult && start.request == startRequest_ && startCommitted_) {
-            print(start.status == frostlaunch::dispatched
-                ? "[game] peer-loading: второй игрок загружает город."
-                : "[game] peer-failed: второму игроку не удалось запустить город.");
+            selectedMapIndex_ = start.mapIndex;
+            const LONG state = requestLocalPrepare(selectedMapIndex_);
+            clientMapPreparing_ = state == frostlaunch::prepareRequested;
+            launchDeadline_ = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+            if (!clientMapPreparing_)
+                sendStart(MessageType::startResult, startRequest_, frostlaunch::failed,
+                          selectedMapIndex_);
+        } else if (type == MessageType::startGo && !host_ && clientMapPrepared_ &&
+                   start.request == startRequest_ && start.mapIndex == selectedMapIndex_) {
+            commitLocalPreparedMap();
+        } else if (type == MessageType::startResult && host_ && waitingClientMap_ &&
+                   start.request == startRequest_ && start.status == frostlaunch::prepared) {
+            waitingClientMap_ = false;
+            if (start.mapIndex != selectedMapIndex_) {
+                print("[game] rejected: клиент подготовил другую карту.");
+                return;
+            }
+            sendStart(MessageType::startGo, startRequest_, frostlaunch::commitRequested,
+                      selectedMapIndex_);
+            commitLocalPreparedMap();
+        } else if (type == MessageType::startResult && start.request == startRequest_ &&
+                   start.status == frostlaunch::dispatched) {
+            print("[game] peer-loading: второй игрок запустил ту же карту.");
+        } else if (type == MessageType::startResult && start.request == startRequest_ &&
+                   start.status == frostlaunch::failed) {
+            print("[game] peer-failed: второму игроку не удалось подготовить или запустить карту.");
+        }
+    }
+
+    void pollMapLaunch(const std::chrono::steady_clock::time_point now) {
+        const auto launch = localLaunch();
+        if (hostMapPreparing_) {
+            if (launch.state == frostlaunch::prepared) {
+                hostMapPreparing_ = false;
+                waitingClientMap_ = true;
+                selectedMapIndex_ = launch.mapIndex;
+                sendStart(MessageType::startCommit, startRequest_, frostlaunch::prepared,
+                          selectedMapIndex_);
+                launchDeadline_ = now + std::chrono::seconds(30);
+                print("[game] host-map: индекс карты передан клиенту; ожидается подтверждение.");
+            } else if (launch.state == frostlaunch::failed || now > launchDeadline_) {
+                hostMapPreparing_ = false;
+                print("[game] failed: хост не смог подготовить доступную карту.");
+            }
+        }
+        if (clientMapPreparing_) {
+            if (launch.state == frostlaunch::prepared) {
+                clientMapPreparing_ = false;
+                clientMapPrepared_ = true;
+                sendStart(MessageType::startResult, startRequest_, frostlaunch::prepared,
+                          launch.mapIndex);
+                print("[game] client-map: карта хоста подготовлена; ожидается общий старт.");
+            } else if (launch.state == frostlaunch::failed || now > launchDeadline_) {
+                clientMapPreparing_ = false;
+                sendStart(MessageType::startResult, startRequest_, frostlaunch::failed,
+                          selectedMapIndex_);
+            }
+        }
+        if (waitingClientMap_ && now > launchDeadline_) {
+            waitingClientMap_ = false;
+            print("[game] failed: клиент не подтвердил карту за 30 секунд.");
         }
     }
 
@@ -857,11 +1494,14 @@ private:
                 print("[game] rejected: запуск доступен только подключённому LAN-хосту, один раз за сессию.");
                 return;
             }
-            if (localLaunch() != frostlaunch::ready) {
+            if (localLaunch().state != frostlaunch::ready) {
                 print("[game] rejected: откройте меню подключения в игре; необходим обновлённый мод.");
                 return;
             }
             ++startRequest_;
+            selectedMapIndex_ = -1;
+            hostMapPreparing_ = clientMapPreparing_ = clientMapPrepared_ = false;
+            waitingClientMap_ = false;
             waitingStart_ = true;
             launchDeadline_ = std::chrono::steady_clock::now() + std::chrono::seconds(10);
             sendStart(MessageType::startPrepare, startRequest_, 0);
@@ -888,6 +1528,8 @@ private:
             }
             sendPacket(makePacket(MessageType::citySnapshot, ++sequence_, local_, status),
                        true);
+            lastLocalCity_ = status;
+            overlay_.local(status);
             print("[city] snapshot sent.");
             return;
         }
@@ -942,8 +1584,12 @@ private:
                       ", city: " + hello.cityName +
                       (header.type == MessageType::hello ? " (hello)" : " (connected)"));
                 if (header.type == MessageType::hello) sendHello(MessageType::helloAck);
-            } else if (connected_ && header.type >= MessageType::startPrepare &&
-                       header.type <= MessageType::startResult && header.payloadBytes == sizeof(StartPayload)) {
+                overlay_.connected(playerName_, peerName_);
+            } else if (connected_ &&
+                       ((header.type >= MessageType::startPrepare &&
+                         header.type <= MessageType::startResult) ||
+                        header.type == MessageType::startGo) &&
+                       header.payloadBytes == sizeof(StartPayload)) {
                 StartPayload start{};
                 std::memcpy(&start, payload, sizeof(start));
                 receiveStart(header.type, start);
@@ -951,7 +1597,30 @@ private:
                        header.payloadBytes == sizeof(CitySnapshotPayload)) {
                 CitySnapshotPayload city{};
                 std::memcpy(&city, payload, sizeof(city));
+                if (city.hope < -1 || city.hope > 10000 ||
+                    city.discontent < -1 || city.discontent > 10000) continue;
                 resourceLine(peerName_, city);
+                overlay_.peer(city);
+            } else if (connected_ && header.type == MessageType::transferRequest &&
+                       header.payloadBytes == sizeof(TransferRequestPayload)) {
+                TransferRequestPayload request{};
+                std::memcpy(&request, payload, sizeof(request));
+                receiveTransferRequest(request);
+            } else if (connected_ && header.type == MessageType::transferResult &&
+                       header.payloadBytes == sizeof(TransferResultPayload)) {
+                TransferResultPayload result{};
+                std::memcpy(&result, payload, sizeof(result));
+                receiveTransferResult(result);
+            } else if (connected_ && header.type == MessageType::pauseState &&
+                       header.payloadBytes == sizeof(PausePayload)) {
+                PausePayload pause{};
+                std::memcpy(&pause, payload, sizeof(pause));
+                receivePause(pause);
+            } else if (connected_ && header.type == MessageType::sessionState &&
+                       header.payloadBytes == sizeof(SessionStatePayload)) {
+                SessionStatePayload state{};
+                std::memcpy(&state, payload, sizeof(state));
+                receiveSessionState(state);
             } else if (connected_ && header.type == MessageType::chat) {
                 print("[peer] " + std::string(reinterpret_cast<const char*>(payload),
                                                header.payloadBytes));
@@ -964,6 +1633,7 @@ private:
         auto nextHello = std::chrono::steady_clock::now() + std::chrono::seconds(2);
         auto nextHeartbeat = std::chrono::steady_clock::now() + std::chrono::seconds(5);
         auto nextCityRead = std::chrono::steady_clock::now();
+        auto nextSessionState = std::chrono::steady_clock::now();
 
         while (running_.load(std::memory_order_acquire)) {
             transport_.pump();
@@ -975,12 +1645,15 @@ private:
             drainCommands();
 
             const auto now = std::chrono::steady_clock::now();
+            pollOverlay(now);
+            pollGameSession(now);
+            pollMapLaunch(now);
             if (waitingStart_ && now > launchDeadline_) {
                 waitingStart_ = false;
                 print("[game] rejected: второй игрок не подтвердил готовность за 10 секунд.");
             }
             if (startCommitted_ && !launchReported_) {
-                const LONG state = localLaunch();
+                const LONG state = localLaunch().state;
                 if (state == frostlaunch::dispatched || state == frostlaunch::failed || now > launchDeadline_) {
                     launchReported_ = true;
                     const bool ok = state == frostlaunch::dispatched;
@@ -1001,12 +1674,18 @@ private:
                            false);
                 nextHeartbeat = now + std::chrono::seconds(5);
             }
+            if (connected_ && now >= nextSessionState) {
+                sendSessionState();
+                nextSessionState = now + std::chrono::seconds(1);
+            }
             if (connected_ && watchFrostpunk_ && now >= nextCityRead) {
                 if (const auto city = readLocalCity(frostpunkProcessId_)) {
                     {
                         sendPacket(makePacket(MessageType::citySnapshot, ++sequence_, local_,
                                               *city), false);
                         resourceLine(playerName_, *city);
+                        overlay_.local(*city);
+                        lastLocalCity_ = *city;
                     }
                     frostpunkMissingReported_ = false;
                 } else if (!frostpunkMissingReported_) {
@@ -1020,6 +1699,8 @@ private:
             queueChanged_.wait_for(lock, std::chrono::milliseconds(25));
         }
         transport_.close();
+        overlay_.close();
+        gameSession_.close();
     }
 
     PacketTransport& transport_;
@@ -1030,10 +1711,26 @@ private:
     bool watchFrostpunk_ = false;
     DWORD frostpunkProcessId_ = 0;
     bool host_ = false, waitingStart_ = false, prepared_ = false;
+    bool hostMapPreparing_ = false, waitingClientMap_ = false;
+    bool clientMapPreparing_ = false, clientMapPrepared_ = false;
     bool startCommitted_ = false, launchReported_ = false;
     std::uint32_t startRequest_ = 0;
+    LONG selectedMapIndex_ = -1;
     std::chrono::steady_clock::time_point launchDeadline_{};
     std::string peerName_;
+    std::optional<CitySnapshotPayload> lastLocalCity_;
+    TransferResultPayload lastIncomingResult_{};
+    std::uint32_t nextTransferId_ = 0;
+    OverlayBridge overlay_;
+    GameSessionBridge gameSession_;
+    struct PendingPause {
+        bool active = false;
+        bool paused = true;
+        std::chrono::steady_clock::time_point deadline{};
+    } pendingPause_;
+    std::optional<SessionStatePayload> peerSession_;
+    bool sessionBarrierReleased_ = false;
+    bool skewReported_ = false;
     bool frostpunkMissingReported_ = false;
     std::chrono::steady_clock::time_point started_;
     std::chrono::steady_clock::time_point lastReceived_{};

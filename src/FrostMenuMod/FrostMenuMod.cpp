@@ -1,15 +1,22 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <windowsx.h>
+#include <commctrl.h>
 #include <tlhelp32.h>
 
 #include <atomic>
+#include <algorithm>
+#include <climits>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <string>
 #include <vector>
 #include "../LaunchControl.h"
+#include "../OverlayControl.h"
+#include "../SessionControl.h"
+#include "../FrostBridgeNet/ResourceReader.h"
 
 namespace {
 
@@ -132,10 +139,30 @@ UINT g_launchMessage = 0;
 DWORD g_uiThread = 0;
 int g_launchStage = 0; // accessed only on the game's window thread
 int g_nextMapIndex = 0;
+int g_selectedMapIndex = -1;
+bool g_mapSelectionIssued = false;
 ULONGLONG g_launchDeadline = 0;
 void* g_endlessSelection = nullptr;
 void* g_endlessConfig = nullptr;
 MainMenuUpdate g_originalEndlessBuild = nullptr, g_originalEndlessShow = nullptr;
+HANDLE g_overlayMapping = nullptr;
+frostoverlay::Control* g_overlayControl = nullptr;
+HWND g_overlayWindow = nullptr;
+HWND g_overlayButtonWindow = nullptr;
+std::atomic<bool> g_overlayExpanded = false;
+LONG g_lastApplySequence = 0;
+RECT g_plusButtons[frostoverlay::resourceCount]{};
+HWND g_amountEdits[frostoverlay::resourceCount]{};
+HWND g_amountSliders[frostoverlay::resourceCount]{};
+bool g_updatingAmounts = false;
+HANDLE g_sessionMapping = nullptr;
+frostsession::Control* g_sessionControl = nullptr;
+LONG g_lastPauseCommand = 0;
+bool g_sessionLoaded = false;
+bool g_sessionPaused = true;
+bool g_pendingInitialPause = false;
+std::uint64_t g_overlayPaintRevision = 0;
+ULONGLONG g_sessionNextProbe = 0;
 
 void logLine(const wchar_t* message) {
     wchar_t modulePath[MAX_PATH]{};
@@ -573,8 +600,11 @@ HWND findGameWindow() {
             auto* search = reinterpret_cast<Search*>(value);
             DWORD processId = 0;
             GetWindowThreadProcessId(window, &processId);
+            wchar_t className[64]{};
+            GetClassNameW(window, className, static_cast<int>(std::size(className)));
             if (processId == search->processId && IsWindowVisible(window) &&
-                GetWindow(window, GW_OWNER) == nullptr) {
+                GetWindow(window, GW_OWNER) == nullptr &&
+                wcscmp(className, L"SDL_app") == 0) {
                 search->window = window;
                 return FALSE;
             }
@@ -582,6 +612,617 @@ HWND findGameWindow() {
         },
         reinterpret_cast<LPARAM>(&search));
     return search.window;
+}
+
+bool safeCopyMemory(std::uintptr_t address, void* destination, std::size_t size) {
+    __try {
+        std::memcpy(destination, reinterpret_cast<const void*>(address), size);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+int invokeResourceChange(void* economy, void* entry, int delta) {
+    // RVA 168E680 is the native four-argument wrapper. It supplies a null event
+    // context and the stock false option to the core ChangeResource routine.
+    using ChangeResource = int(__fastcall*)(void*, void*, int, int);
+    __try {
+        return reinterpret_cast<ChangeResource>(g_gameBase + 0x168E680)(
+            economy, entry, delta, 0);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
+void advanceOverlayApply() {
+    if (!g_overlayControl || g_overlayControl->signature != frostoverlay::magic ||
+        g_overlayControl->layoutVersion != frostoverlay::version) return;
+    const LONG sequence = InterlockedCompareExchange(
+        &g_overlayControl->applyRequestSequence, 0, 0);
+    if (!sequence || sequence == g_lastApplySequence) return;
+    g_lastApplySequence = sequence; // exactly once, even if validation fails
+    MemoryBarrier();
+    const LONG resource = g_overlayControl->applyResource;
+    const LONG delta = g_overlayControl->applyDelta;
+    LONG result = 0;
+    if (frostoverlay::validResource(resource) && delta &&
+        delta >= -frostoverlay::maxTransferAmount && delta <= frostoverlay::maxTransferAmount) {
+        auto reader = [](std::uintptr_t address, void* destination, std::size_t size) {
+            return safeCopyMemory(address, destination, size);
+        };
+        const auto resolved = frostbridge::resources::readResolved(reader, g_gameBase);
+        std::uintptr_t economy = 0;
+        if (resolved && safeCopyMemory(g_gameBase + frostbridge::resources::economyRva,
+                                       &economy, sizeof(economy)) && economy) {
+            result = invokeResourceChange(reinterpret_cast<void*>(economy),
+                reinterpret_cast<void*>(resolved->entries[static_cast<std::size_t>(resource)]), delta);
+        }
+    }
+    g_overlayControl->applyResult = result;
+    MemoryBarrier();
+    InterlockedExchange(&g_overlayControl->applyResultSequence, sequence);
+}
+
+void publishLocalPause(bool paused) {
+    g_sessionPaused = paused;
+    if (!g_sessionControl) return;
+    InterlockedExchange(&g_sessionControl->paused, paused ? 1 : 0);
+    InterlockedExchange(&g_sessionControl->localPauseValue, paused ? 1 : 0);
+    MemoryBarrier();
+    InterlockedIncrement(&g_sessionControl->localPauseSequence);
+}
+
+// Recovered from BUTTON_PAUSE callback RVA 1B1A8D0. This is the native
+// UserPause API, not synthetic input. Called only on the game window thread.
+bool nativeTimeState(std::uintptr_t& object, bool& paused, LONG64& timeMs) {
+    std::uintptr_t vtable = 0;
+    unsigned char flag = 0;
+    std::int64_t ticks = 0;
+    if (!safeCopyMemory(g_gameBase + 0x2B6A710, &object, sizeof(object)) || !object ||
+        !safeCopyMemory(object, &vtable, sizeof(vtable)) || vtable != g_gameBase + 0x1DFCB80 ||
+        !safeCopyMemory(object + 0xE0, &flag, sizeof(flag)) || flag > 1 ||
+        !safeCopyMemory(object + 0xB0, &ticks, sizeof(ticks)) || ticks < 0) return false;
+    paused = flag != 0;
+    // Same scale used by the game's calendar conversion at RVA 11AE360.
+    // 64-bit calendar milliseconds remain valid for cities longer than 24 days.
+    int hourScale = 0;
+    if (!safeCopyMemory(g_gameBase + 0x2B70CC0, &hourScale, sizeof(hourScale)) ||
+        hourScale <= 0 || hourScale > 1000000) return false;
+    timeMs = static_cast<LONG64>((ticks / 2147483648.0) * 3600000.0 / hourScale);
+    return true;
+}
+
+bool applyNativePause(bool pause) {
+    std::uintptr_t object = 0;
+    bool actual = false;
+    LONG64 time = 0;
+    if (!nativeTimeState(object, actual, time)) return false;
+    // Fail closed on an unsupported instruction stream, even if a launcher was bypassed.
+    constexpr unsigned char expected[]{0x48,0x89,0x5C,0x24,0x10,0x57,0x48,0x83,0xEC,0x20};
+    unsigned char code[sizeof(expected)]{};
+    if (!safeCopyMemory(g_gameBase + 0x11BD0E0, code, sizeof(code)) ||
+        std::memcmp(code, expected, sizeof(code))) return false;
+    using SetPause = void(__fastcall*)(void*, bool, bool);
+    __try {
+        reinterpret_cast<SetPause>(g_gameBase + 0x11BD0E0)(
+            reinterpret_cast<void*>(object), pause, false);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    return nativeTimeState(object, actual, time) && actual == pause;
+}
+
+void observeSessionInput(const MSG&) {
+    // Native state is observed after the engine handles input, including hotkeys.
+    // Coordinates/key guesses used to report a pause which had never happened.
+}
+
+void advanceSessionControl() {
+    if (!g_sessionControl || g_sessionControl->signature != frostsession::magic ||
+        g_sessionControl->layoutVersion != frostsession::version) return;
+    const ULONGLONG now = GetTickCount64();
+    bool justLoaded = false;
+    if (now >= g_sessionNextProbe) {
+        g_sessionNextProbe = now + 100;
+        auto reader = [](std::uintptr_t address, void* destination, std::size_t size) {
+            return safeCopyMemory(address, destination, size);
+        };
+        const bool loaded = frostbridge::resources::readResolved(reader, g_gameBase).has_value();
+        if (loaded != g_sessionLoaded) {
+            g_sessionLoaded = loaded;
+            justLoaded = loaded;
+            // Publish loaded only after native pause/time can actually be read.
+            if (!loaded) {
+                InterlockedExchange(&g_sessionControl->gameLoaded, 0);
+                g_pendingInitialPause = false;
+            }
+            InterlockedIncrement(&g_sessionControl->loadGeneration);
+        }
+    }
+    if (!g_sessionLoaded) return;
+    const bool connected = g_overlayControl &&
+        InterlockedCompareExchange(&g_overlayControl->connection, 0, 0) ==
+            static_cast<LONG>(frostoverlay::Connection::connected);
+    const LONG sequence = InterlockedCompareExchange(
+        &g_sessionControl->pauseCommandSequence, 0, 0);
+    bool ownChange = false;
+    if (justLoaded && connected) g_pendingInitialPause = true;
+    if (g_pendingInitialPause && applyNativePause(true)) {
+        ownChange = true;
+        g_pendingInitialPause = false;
+    }
+    if (sequence && sequence != g_lastPauseCommand) {
+        MemoryBarrier();
+        if (applyNativePause(g_sessionControl->pauseCommandValue != 0)) {
+            ownChange = true;
+            g_lastPauseCommand = sequence;
+            InterlockedExchange(&g_sessionControl->pauseResultSequence, sequence);
+        } // Unavailable during loading: retry; never acknowledge a synthetic click.
+    }
+    std::uintptr_t object = 0;
+    bool paused = false;
+    LONG64 nativeTime = 0;
+    if (!nativeTimeState(object, paused, nativeTime)) {
+        InterlockedExchange(&g_sessionControl->gameLoaded, 0);
+        return;
+    }
+    if (!justLoaded && !ownChange && paused != g_sessionPaused) publishLocalPause(paused);
+    g_sessionPaused = paused;
+    InterlockedExchange(&g_sessionControl->paused, paused ? 1 : 0);
+    InterlockedExchange64(&g_sessionControl->gameTimeMs, nativeTime);
+    InterlockedExchange(&g_sessionControl->gameLoaded, 1);
+}
+
+std::wstring utf8Name(const char* input, const wchar_t* fallback) {
+    if (!input || !*input) return fallback;
+    const int size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, input, -1,
+                                         nullptr, 0);
+    if (size <= 1 || size > 128) return fallback;
+    std::wstring result(static_cast<std::size_t>(size), L'\0');
+    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, input, -1,
+                        result.data(), size);
+    result.resize(static_cast<std::size_t>(size - 1));
+    return result;
+}
+
+void overlayNames(std::wstring& local, std::wstring& peer) {
+    if (!g_overlayControl) { local = L"Вы"; peer = L"Игрок 2"; return; }
+    char localBytes[64]{}, peerBytes[64]{};
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        const LONG before = InterlockedCompareExchange(
+            &g_overlayControl->namesSequence, 0, 0);
+        if (before & 1) continue;
+        MemoryBarrier();
+        std::memcpy(localBytes, g_overlayControl->localName, sizeof(localBytes));
+        std::memcpy(peerBytes, g_overlayControl->peerName, sizeof(peerBytes));
+        MemoryBarrier();
+        if (before == InterlockedCompareExchange(&g_overlayControl->namesSequence, 0, 0)) break;
+    }
+    localBytes[63] = peerBytes[63] = '\0';
+    local = utf8Name(localBytes, L"Вы");
+    peer = utf8Name(peerBytes, L"Игрок 2");
+}
+
+LONG selectedAmount(LONG resource) {
+    wchar_t text[16]{};
+    GetWindowTextW(g_amountEdits[resource], text, 16);
+    if (!*text) return 0;
+    LONG value = 0;
+    for (const wchar_t* p = text; *p; ++p) {
+        if (*p < L'0' || *p > L'9' || value > frostoverlay::maxTransferAmount / 10) return 0;
+        value = value * 10 + (*p - L'0');
+        if (value > frostoverlay::maxTransferAmount) return 0;
+    }
+    return value;
+}
+
+bool canSend(LONG resource, const frostoverlay::Values& local) {
+    const LONG amount = selectedAmount(resource);
+    return g_overlayControl && frostoverlay::validAmount(amount) &&
+        local.item[resource] >= amount &&
+        InterlockedCompareExchange(&g_overlayControl->connection, 0, 0) ==
+            static_cast<LONG>(frostoverlay::Connection::connected) &&
+        !InterlockedCompareExchange(&g_overlayControl->transferBusy, 0, 0);
+}
+
+std::uint64_t overlayPaintRevision() {
+    if (!g_overlayControl) return 0;
+    std::uint64_t value = 1469598103934665603ULL;
+    auto mix = [&](LONG item) {
+        value ^= static_cast<std::uint32_t>(item);
+        value *= 1099511628211ULL;
+    };
+    mix(InterlockedCompareExchange(&g_overlayControl->local.sequence, 0, 0));
+    mix(InterlockedCompareExchange(&g_overlayControl->peer.sequence, 0, 0));
+    mix(InterlockedCompareExchange(&g_overlayControl->namesSequence, 0, 0));
+    mix(InterlockedCompareExchange(&g_overlayControl->notificationSequence, 0, 0));
+    mix(InterlockedCompareExchange(&g_overlayControl->transferBusy, 0, 0));
+    mix(InterlockedCompareExchange(&g_overlayControl->localHope, 0, 0));
+    mix(InterlockedCompareExchange(&g_overlayControl->localDiscontent, 0, 0));
+    mix(InterlockedCompareExchange(&g_overlayControl->peerHope, 0, 0));
+    mix(InterlockedCompareExchange(&g_overlayControl->peerDiscontent, 0, 0));
+    return value;
+}
+
+void placeOverlayWindow(HWND window, int x, int y, int width, int height) {
+    RECT current{};
+    const bool visible = IsWindowVisible(window) != FALSE;
+    if (!GetWindowRect(window, &current) || current.left != x || current.top != y ||
+        current.right - current.left != width || current.bottom - current.top != height) {
+        SetWindowPos(window, HWND_TOPMOST, x, y, width, height,
+                     SWP_NOACTIVATE | (visible ? 0 : SWP_SHOWWINDOW));
+    } else if (!visible) {
+        ShowWindow(window, SW_SHOWNOACTIVATE);
+    }
+}
+
+void refreshAmountControls(const frostoverlay::Values& local) {
+    for (LONG i = 0; i < static_cast<LONG>(frostoverlay::resourceCount); ++i) {
+        if (!g_amountSliders[i]) continue;
+        const LONG maximum = std::clamp(local.item[i], 0L, frostoverlay::maxTransferAmount);
+        SendMessageW(g_amountSliders[i], TBM_SETRANGEMAX, TRUE, maximum);
+        SendMessageW(g_amountSliders[i], TBM_SETPOS, TRUE, (std::min)(selectedAmount(i), maximum));
+        EnableWindow(g_amountSliders[i], maximum > 0);
+    }
+}
+
+void drawVitalBars(HDC dc, int top, LONG hope, LONG discontent) {
+    const LONG values[]{discontent, hope};
+    const wchar_t* labels[]{L"Недовольство", L"Надежда"};
+    for (int i = 0; i < 2; ++i) {
+        const int x = 18 + i * 400;
+        RECT bar{x, top, x + 380, top + 23};
+        HBRUSH bg = CreateSolidBrush(RGB(41, 48, 53));
+        FillRect(dc, &bar, bg); DeleteObject(bg);
+        if (values[i] >= 0 && values[i] <= 10000) {
+            RECT fill = bar;
+            fill.right = fill.left + 380 * values[i] / 10000;
+            HBRUSH brush = CreateSolidBrush(i ? RGB(40, 142, 189) : RGB(172, 45, 49));
+            FillRect(dc, &fill, brush); DeleteObject(brush);
+        }
+        wchar_t label[80]{};
+        if (values[i] < 0) _snwprintf_s(label, _TRUNCATE, L"%s: нет данных", labels[i]);
+        else _snwprintf_s(label, _TRUNCATE, L"%s: %.1f%%", labels[i], values[i] / 100.0);
+        SetTextColor(dc, RGB(245,245,245));
+        DrawTextW(dc, label, -1, &bar, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    }
+}
+
+void drawOverlayRow(HDC dc, int top, const std::wstring& player,
+                    const frostoverlay::Values& values, bool buttons,
+                    HFONT normalFont, HFONT smallFont, const frostoverlay::Values& local) {
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, buttons ? RGB(246, 197, 70) : RGB(190, 202, 210));
+    SelectObject(dc, normalFont);
+    RECT playerRect{18, top, 800, top + 25};
+    DrawTextW(dc, player.c_str(), -1, &playerRect, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+    constexpr const wchar_t* labels[] = {
+        L"Уголь", L"Древесина", L"Сталь", L"Паровые ядра", L"Сырая еда", L"Пайки"};
+    SelectObject(dc, smallFont);
+    for (LONG resource = 0; resource < static_cast<LONG>(frostoverlay::resourceCount); ++resource) {
+        const int column = resource % 3;
+        const int row = resource / 3;
+        const int left = 18 + column * 266;
+        const int y = top + 29 + row * (buttons ? 78 : 32);
+        wchar_t text[96]{};
+        _snwprintf_s(text, _TRUNCATE, L"%s: %ld", labels[resource], values.item[resource]);
+        SetTextColor(dc, RGB(235, 238, 240));
+        RECT valueRect{left, y, left + 210, y + 26};
+        DrawTextW(dc, text, -1, &valueRect, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        if (buttons) {
+            RECT button{left + 213, y + 29, left + 243, y + 54};
+            g_plusButtons[resource] = button;
+            const bool enabled = canSend(resource, local);
+            HBRUSH fill = CreateSolidBrush(enabled ? RGB(133, 97, 25) : RGB(56, 60, 64));
+            FillRect(dc, &button, fill);
+            DeleteObject(fill);
+            FrameRect(dc, &button, static_cast<HBRUSH>(GetStockObject(GRAY_BRUSH)));
+            SetTextColor(dc, enabled ? RGB(255, 224, 128) : RGB(120, 124, 128));
+            DrawTextW(dc, L"+", -1, &button, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+        }
+    }
+}
+
+LRESULT CALLBACK overlayWindowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
+    switch (message) {
+    case WM_CREATE:
+        for (int i = 0; i < static_cast<int>(frostoverlay::resourceCount); ++i) {
+            const int left = 18 + (i % 3) * 266, y = 174 + 29 + (i / 3) * 78 + 29;
+            g_amountEdits[i] = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"1",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_NUMBER | ES_AUTOHSCROLL,
+                left, y, 66, 25, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(100 + i)), g_module, nullptr);
+            SendMessageW(g_amountEdits[i], EM_SETLIMITTEXT, 7, 0);
+            SendMessageW(g_amountEdits[i], WM_SETFONT,
+                reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
+            g_amountSliders[i] = CreateWindowExW(0, TRACKBAR_CLASSW, L"",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | TBS_NOTICKS,
+                left + 72, y, 133, 25, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(200 + i)), g_module, nullptr);
+            SendMessageW(g_amountSliders[i], TBM_SETRANGEMIN, FALSE, 0);
+        }
+        return 0;
+    case WM_NCHITTEST: return HTCLIENT; // Panel absorbs clicks; no accidental city actions.
+    case WM_MOUSEACTIVATE: return MA_ACTIVATE; // Text fields need keyboard focus.
+    case WM_CLOSE:
+        g_overlayExpanded.store(false);
+        ShowWindow(window, SW_HIDE);
+        if (HWND game = findGameWindow()) SetForegroundWindow(game);
+        return 0;
+    case WM_COMMAND:
+        if (LOWORD(wp) >= 100 && LOWORD(wp) < 106 && HIWORD(wp) == EN_CHANGE &&
+            !g_updatingAmounts && g_overlayControl) {
+            frostoverlay::Values local{};
+            if (frostoverlay::readSnapshot(g_overlayControl->local, local))
+                refreshAmountControls(local);
+            InvalidateRect(window, nullptr, FALSE);
+        }
+        return 0;
+    case WM_HSCROLL:
+        for (int i = 0; i < static_cast<int>(frostoverlay::resourceCount); ++i) {
+            if (reinterpret_cast<HWND>(lp) != g_amountSliders[i]) continue;
+            const auto amount = static_cast<LONG>(SendMessageW(g_amountSliders[i], TBM_GETPOS, 0, 0));
+            g_updatingAmounts = true;
+            SetWindowTextW(g_amountEdits[i], std::to_wstring(amount).c_str());
+            g_updatingAmounts = false;
+            InvalidateRect(window, nullptr, FALSE);
+        }
+        return 0;
+    case WM_LBUTTONUP: {
+        const POINT point{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        if (!g_overlayControl || InterlockedCompareExchange(
+                &g_overlayControl->connection, 0, 0) !=
+                static_cast<LONG>(frostoverlay::Connection::connected) ||
+            InterlockedCompareExchange(&g_overlayControl->transferBusy, 0, 0)) return 0;
+        frostoverlay::Values local{};
+        if (!frostoverlay::readSnapshot(g_overlayControl->local, local)) return 0;
+        for (LONG resource = 0; resource < static_cast<LONG>(frostoverlay::resourceCount); ++resource) {
+            if (!canSend(resource, local) ||
+                !PtInRect(&g_plusButtons[resource], point)) continue;
+            g_overlayControl->outgoingResource = resource;
+            g_overlayControl->outgoingAmount = selectedAmount(resource);
+            MemoryBarrier();
+            InterlockedIncrement(&g_overlayControl->outgoingSequence);
+            InvalidateRect(window, nullptr, FALSE);
+            break;
+        }
+        return 0;
+    }
+    case WM_TIMER: {
+        HWND game = findGameWindow();
+        const bool connected = g_overlayControl &&
+            InterlockedCompareExchange(&g_overlayControl->connection, 0, 0) ==
+                static_cast<LONG>(frostoverlay::Connection::connected);
+        const bool cityLoaded = g_sessionControl &&
+            InterlockedCompareExchange(&g_sessionControl->modReady, 0, 0) &&
+            InterlockedCompareExchange(&g_sessionControl->gameLoaded, 0, 0);
+        HWND foreground = GetForegroundWindow();
+        DWORD foregroundProcess = 0;
+        if (foreground) GetWindowThreadProcessId(foreground, &foregroundProcess);
+        const bool thisGameIsActive = foregroundProcess == GetCurrentProcessId();
+        if (!game || IsIconic(game) || !connected || !cityLoaded || !thisGameIsActive ||
+            !g_overlayExpanded.load(std::memory_order_acquire)) {
+            if (IsWindowVisible(window)) ShowWindow(window, SW_HIDE);
+        } else {
+            if (GetWindow(window, GW_OWNER) != game) {
+                SetWindowLongPtrW(window, GWLP_HWNDPARENT,
+                                  reinterpret_cast<LONG_PTR>(game));
+            }
+            RECT client{};
+            GetClientRect(game, &client);
+            POINT origin{};
+            ClientToScreen(game, &origin);
+            constexpr int width = 820, height = 410;
+            const int x = origin.x + (client.right - width) / 2;
+            const int y = origin.y + (client.bottom - height) / 2;
+            placeOverlayWindow(window, x, y, width, height);
+        }
+        const auto revision = overlayPaintRevision();
+        if (revision != g_overlayPaintRevision) {
+            g_overlayPaintRevision = revision;
+            if (IsWindowVisible(window)) InvalidateRect(window, nullptr, FALSE);
+        }
+        return 0;
+    }
+    case WM_PRINTCLIENT:
+    case WM_PAINT: {
+        PAINTSTRUCT paint{};
+        HDC target = message == WM_PRINTCLIENT ? reinterpret_cast<HDC>(wp) : BeginPaint(window, &paint);
+        RECT client{};
+        GetClientRect(window, &client);
+        HDC buffer = message == WM_PAINT ? CreateCompatibleDC(target) : nullptr;
+        HBITMAP bitmap = buffer ? CreateCompatibleBitmap(target, client.right, client.bottom) : nullptr;
+        HGDIOBJ oldBitmap = buffer && bitmap ? SelectObject(buffer, bitmap) : nullptr;
+        HDC dc = buffer && bitmap ? buffer : target;
+        HBRUSH background = CreateSolidBrush(RGB(13, 19, 23));
+        FillRect(dc, &client, background);
+        DeleteObject(background);
+        HPEN line = CreatePen(PS_SOLID, 1, RGB(138, 112, 44));
+        const HGDIOBJ oldPen = SelectObject(dc, line);
+        MoveToEx(dc, 12, 32, nullptr); LineTo(dc, client.right - 12, 32);
+        SelectObject(dc, oldPen);
+        DeleteObject(line);
+        HFONT title = CreateFontW(-19, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+        HFONT normal = CreateFontW(-18, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+        HFONT small = CreateFontW(-16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+        SetBkMode(dc, TRANSPARENT);
+        const HGDIOBJ oldFont = SelectObject(dc, title);
+        SetTextColor(dc, RGB(246, 197, 70));
+        RECT heading{12, 5, 808, 30};
+        DrawTextW(dc, L"FROSTPUNK MULTIPLAYER  •  ОБМЕН РЕСУРСАМИ", -1,
+                  &heading, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+        frostoverlay::Values local{}, peer{};
+        if (g_overlayControl) {
+            frostoverlay::readSnapshot(g_overlayControl->local, local);
+            frostoverlay::readSnapshot(g_overlayControl->peer, peer);
+        }
+        std::wstring localName, peerName;
+        overlayNames(localName, peerName);
+        refreshAmountControls(local);
+        drawOverlayRow(dc, 39, localName + L" (вы)", local, false, normal, small, local);
+        drawVitalBars(dc, 136, g_overlayControl ? g_overlayControl->localHope : -1,
+            g_overlayControl ? g_overlayControl->localDiscontent : -1);
+        drawOverlayRow(dc, 174, peerName + L" (получатель)", peer, true, normal, small, local);
+        drawVitalBars(dc, 344, g_overlayControl ? g_overlayControl->peerHope : -1,
+            g_overlayControl ? g_overlayControl->peerDiscontent : -1);
+
+        wchar_t notification[160]{};
+        if (g_overlayControl) {
+            const LONG before = InterlockedCompareExchange(
+                &g_overlayControl->notificationSequence, 0, 0);
+            std::memcpy(notification, g_overlayControl->notification, sizeof(notification));
+            MemoryBarrier();
+            if (before != InterlockedCompareExchange(
+                    &g_overlayControl->notificationSequence, 0, 0)) notification[0] = L'\0';
+        }
+        SetTextColor(dc, RGB(184, 195, 202));
+        SelectObject(dc, small);
+        RECT status{18, 376, 800, 403};
+        DrawTextW(dc, notification[0] ? notification : L"Выберите количество полем или ползунком, затем нажмите +. Повторный MULTIPLAYER закроет панель.",
+                  -1, &status, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_VCENTER);
+        SelectObject(dc, oldFont);
+        DeleteObject(title); DeleteObject(normal); DeleteObject(small);
+        if (message == WM_PAINT) {
+            if (buffer && bitmap) BitBlt(target, 0, 0, client.right, client.bottom,
+                                         buffer, 0, 0, SRCCOPY);
+            if (oldBitmap) SelectObject(buffer, oldBitmap);
+            if (bitmap) DeleteObject(bitmap);
+            if (buffer) DeleteDC(buffer);
+            EndPaint(window, &paint);
+        }
+        return 0;
+    }
+    case WM_ERASEBKGND:
+        return 1;
+    }
+    return DefWindowProcW(window, message, wp, lp);
+}
+
+LRESULT CALLBACK overlayButtonWindowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
+    switch (message) {
+    case WM_NCHITTEST:
+        return HTCLIENT;
+    case WM_MOUSEACTIVATE:
+        return MA_NOACTIVATE;
+    case WM_LBUTTONUP:
+        g_overlayExpanded.store(!g_overlayExpanded.load(std::memory_order_acquire),
+                                std::memory_order_release);
+        InvalidateRect(window, nullptr, FALSE);
+        if (g_overlayWindow) InvalidateRect(g_overlayWindow, nullptr, FALSE);
+        return 0;
+    case WM_TIMER: {
+        HWND game = findGameWindow();
+        const bool connected = g_overlayControl &&
+            InterlockedCompareExchange(&g_overlayControl->connection, 0, 0) ==
+                static_cast<LONG>(frostoverlay::Connection::connected);
+        const bool cityLoaded = g_sessionControl &&
+            InterlockedCompareExchange(&g_sessionControl->modReady, 0, 0) &&
+            InterlockedCompareExchange(&g_sessionControl->gameLoaded, 0, 0);
+        HWND foreground = GetForegroundWindow();
+        DWORD foregroundProcess = 0;
+        if (foreground) GetWindowThreadProcessId(foreground, &foregroundProcess);
+        if (!game || IsIconic(game) || !connected || !cityLoaded ||
+            foregroundProcess != GetCurrentProcessId()) {
+            if (IsWindowVisible(window)) ShowWindow(window, SW_HIDE);
+            if (g_overlayWindow && IsWindowVisible(g_overlayWindow))
+                ShowWindow(g_overlayWindow, SW_HIDE);
+        } else {
+            if (GetWindow(window, GW_OWNER) != game) {
+                SetWindowLongPtrW(window, GWLP_HWNDPARENT,
+                                  reinterpret_cast<LONG_PTR>(game));
+            }
+            RECT client{};
+            GetClientRect(game, &client);
+            POINT origin{};
+            ClientToScreen(game, &origin);
+            constexpr int width = 166, height = 30;
+            const int x = origin.x + client.right / 2 - width / 2;
+            const int y = origin.y + 128;
+            placeOverlayWindow(window, x, y, width, height);
+        }
+        return 0;
+    }
+    case WM_PAINT: {
+        PAINTSTRUCT paint{};
+        HDC dc = BeginPaint(window, &paint);
+        RECT client{};
+        GetClientRect(window, &client);
+        HBRUSH background = CreateSolidBrush(RGB(13, 19, 23));
+        FillRect(dc, &client, background);
+        DeleteObject(background);
+        HPEN border = CreatePen(PS_SOLID, 1, RGB(151, 124, 50));
+        HGDIOBJ oldPen = SelectObject(dc, border);
+        HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+        Rectangle(dc, 0, 0, client.right, client.bottom);
+        SelectObject(dc, oldBrush);
+        SelectObject(dc, oldPen);
+        DeleteObject(border);
+        HFONT font = CreateFontW(-17, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+        HGDIOBJ oldFont = SelectObject(dc, font);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, RGB(246, 197, 70));
+        DrawTextW(dc, L"MULTIPLAYER", -1, &client,
+                  DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+        SelectObject(dc, oldFont);
+        DeleteObject(font);
+        EndPaint(window, &paint);
+        return 0;
+    }
+    case WM_ERASEBKGND:
+        return 1;
+    }
+    return DefWindowProcW(window, message, wp, lp);
+}
+
+DWORD WINAPI overlayThread(void*) {
+    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_BAR_CLASSES};
+    InitCommonControlsEx(&controls);
+    WNDCLASSW cls{};
+    cls.lpfnWndProc = overlayWindowProc;
+    cls.hInstance = g_module;
+    cls.lpszClassName = L"FrostBridgeInGameOverlay";
+    cls.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32649)); // IDC_HAND
+    RegisterClassW(&cls);
+    WNDCLASSW buttonClass{};
+    buttonClass.lpfnWndProc = overlayButtonWindowProc;
+    buttonClass.hInstance = g_module;
+    buttonClass.lpszClassName = L"FrostBridgeInGameButton";
+    buttonClass.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32649));
+    RegisterClassW(&buttonClass);
+    HWND owner = nullptr;
+    for (int attempt = 0; attempt < 200 && !owner; ++attempt) {
+        owner = findGameWindow();
+        if (!owner) Sleep(25);
+    }
+    g_overlayWindow = CreateWindowExW(
+        WS_EX_LAYERED | WS_EX_TOOLWINDOW,
+        cls.lpszClassName, L"FrostBridge Overlay", WS_POPUP | WS_CLIPCHILDREN,
+        0, 0, 820, 410, owner, nullptr, g_module, nullptr);
+    if (!g_overlayWindow) {
+        logLine(L"Could not create in-game resource overlay window.");
+        return 1;
+    }
+    SetLayeredWindowAttributes(g_overlayWindow, 0, 235, LWA_ALPHA);
+    g_overlayButtonWindow = CreateWindowExW(
+        WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        buttonClass.lpszClassName, L"FrostBridge Multiplayer", WS_POPUP,
+        0, 0, 166, 30, owner, nullptr, g_module, nullptr);
+    if (!g_overlayButtonWindow) {
+        logLine(L"Could not create in-game multiplayer button.");
+        DestroyWindow(g_overlayWindow);
+        g_overlayWindow = nullptr;
+        return 1;
+    }
+    SetLayeredWindowAttributes(g_overlayButtonWindow, 0, 225, LWA_ALPHA);
+    logLine(L"In-game multiplayer resource overlay initialized.");
+    MSG message{};
+    while (GetMessageW(&message, nullptr, 0, 0) > 0) {
+        TranslateMessage(&message);
+        DispatchMessageW(&message);
+    }
+    return 0;
 }
 
 DWORD WINAPI showConnectionDialog(void* selected) {
@@ -768,13 +1409,29 @@ void advanceEndlessLaunch() {
             InterlockedCompareExchange(&g_launchControl->state, next, state);
             return;
         }
-        if (state != frostlaunch::requested) return;
+        if (state == frostlaunch::prepared || state == frostlaunch::dispatched ||
+            state == frostlaunch::failed) return;
+        if (state == frostlaunch::commitRequested) {
+            if (g_launchStage != 3 || !g_endlessConfig) {
+                InterlockedExchange(&g_launchControl->state, frostlaunch::failed);
+                return;
+            }
+            g_launchStage = 4; // exactly once, including reentrant callbacks
+            reinterpret_cast<MenuPanelCallback>(g_gameBase + 0x1A8ADE0)(g_endlessConfig, nullptr);
+            InterlockedExchange(&g_launchControl->state, frostlaunch::dispatched);
+            logLine(L"Endless launch: synchronized native start callback dispatched.");
+            return;
+        }
+        if (state != frostlaunch::prepareRequested) return;
         if (!g_launchStage) {
             if (!g_multiplayerMode.load() || !g_connectionPanel.load()) {
                 InterlockedExchange(&g_launchControl->state, frostlaunch::failed);
                 return;
             }
             g_launchStage = 1;
+            g_nextMapIndex = 0;
+            g_selectedMapIndex = -1;
+            g_mapSelectionIssued = false;
             g_launchDeadline = GetTickCount64() + 20000;
             g_multiplayerMode.store(false);
             restoreConnectionButtons();
@@ -796,6 +1453,7 @@ void advanceEndlessLaunch() {
             alignas(8) unsigned char event[0x20]{};
             *reinterpret_cast<void***>(event + 8) = &button;
             g_launchStage = 2;
+            g_mapSelectionIssued = false;
             reinterpret_cast<MenuPanelCallback>(g_gameBase + 0x1A879C0)(g_endlessSelection, event);
             logLine(L"Endless launch: first native mode selected.");
         } else if (g_launchStage == 2 && g_endlessConfig) {
@@ -805,23 +1463,40 @@ void advanceEndlessLaunch() {
             if (!safeRead(panel + 0xF0, definition) || !definition ||
                 !safeRead(panel + 0x100, count) || !safeRead(panel + 0x110, index) ||
                 index < 0 || index >= count) return;
-            if (count > 64 || g_nextMapIndex >= count) {
+            LONG requestedMap = InterlockedCompareExchange(&g_launchControl->mapIndex, 0, 0);
+            if (count > 64 || (requestedMap >= 0 && requestedMap >= count) ||
+                (requestedMap < 0 && g_nextMapIndex >= count)) {
                 InterlockedExchange(&g_launchControl->state, frostlaunch::failed);
-                logLine(L"Endless launch: no available map with an enabled Start button.");
+                logLine(L"Endless launch: requested map is unavailable.");
                 return;
             }
-            // The first map may be unowned DLC (e.g. The Rifts). Select through
-            // the native API and inspect its resulting Start enabled state.
-            using SelectMap = void(__fastcall*)(void*, int);
-            reinterpret_cast<SelectMap>(g_gameBase + 0x1A8B880)(g_endlessConfig, g_nextMapIndex++);
+            if (!g_mapSelectionIssued) {
+                // The host discovers its first enabled map. The client receives
+                // that exact index over the network instead of guessing again.
+                g_selectedMapIndex = requestedMap >= 0 ? requestedMap : g_nextMapIndex++;
+                using SelectMap = void(__fastcall*)(void*, int);
+                reinterpret_cast<SelectMap>(g_gameBase + 0x1A8B880)(
+                    g_endlessConfig, g_selectedMapIndex);
+                g_mapSelectionIssued = true;
+                return; // let the native panel refresh Start enabled state
+            }
             void* root = panelElement(g_endlessConfig, kPanelRootOffset);
             void* start = root ? findElement(root, "START_BUTTON") : nullptr;
             std::uint32_t flags = 0;
-            if (!start || !safeRead(static_cast<unsigned char*>(start) + 0x270, flags) || !(flags & 8)) return;
-            g_launchStage = 3; // exactly once, including reentrant callbacks
-            reinterpret_cast<MenuPanelCallback>(g_gameBase + 0x1A8ADE0)(g_endlessConfig, nullptr);
-            InterlockedExchange(&g_launchControl->state, frostlaunch::dispatched);
-            logLine(L"Endless launch: native start callback dispatched.");
+            if (!start || !safeRead(static_cast<unsigned char*>(start) + 0x270, flags)) return;
+            if (!(flags & 8)) {
+                if (requestedMap >= 0) {
+                    InterlockedExchange(&g_launchControl->state, frostlaunch::failed);
+                    logLine(L"Endless launch: host-selected map is unavailable on this client.");
+                } else {
+                    g_mapSelectionIssued = false;
+                }
+                return;
+            }
+            InterlockedExchange(&g_launchControl->mapIndex, g_selectedMapIndex);
+            g_launchStage = 3;
+            InterlockedExchange(&g_launchControl->state, frostlaunch::prepared);
+            logLine(L"Endless launch: synchronized map prepared; waiting for commit.");
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         InterlockedExchange(&g_launchControl->state, frostlaunch::failed);
@@ -832,9 +1507,12 @@ void advanceEndlessLaunch() {
 LRESULT CALLBACK launchMessageHook(int code, WPARAM wp, LPARAM lp) {
     if (code >= 0 && wp == PM_REMOVE) {
         auto* message = reinterpret_cast<MSG*>(lp);
+        observeSessionInput(*message);
         if (message->message == g_launchMessage) {
             message->message = WM_NULL;
             advanceEndlessLaunch();
+            advanceOverlayApply();
+            advanceSessionControl();
         }
     }
     return CallNextHookEx(g_messageHook, code, wp, lp);
@@ -923,12 +1601,62 @@ DWORD WINAPI workerThread(void*) {
         return 1;
     }
     if (!installHooks()) return 2;
+    const auto overlayName = frostoverlay::name(GetCurrentProcessId());
+    g_overlayMapping = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
+        0, sizeof(frostoverlay::Control), overlayName.c_str());
+    const bool overlayCreated = g_overlayMapping && GetLastError() != ERROR_ALREADY_EXISTS;
+    if (g_overlayMapping) {
+        g_overlayControl = static_cast<frostoverlay::Control*>(MapViewOfFile(
+            g_overlayMapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(frostoverlay::Control)));
+    }
+    if (g_overlayControl && overlayCreated) {
+        ZeroMemory(g_overlayControl, sizeof(*g_overlayControl));
+        g_overlayControl->localHope = g_overlayControl->localDiscontent = -1;
+        g_overlayControl->peerHope = g_overlayControl->peerDiscontent = -1;
+        g_overlayControl->layoutVersion = frostoverlay::version;
+        MemoryBarrier();
+        g_overlayControl->signature = frostoverlay::magic;
+    }
+    if (g_overlayControl && g_overlayControl->signature == frostoverlay::magic &&
+        g_overlayControl->layoutVersion == frostoverlay::version) {
+        InterlockedExchange(&g_overlayControl->modReady, 1);
+        HANDLE thread = CreateThread(nullptr, 0, overlayThread, nullptr, 0, nullptr);
+        if (thread) CloseHandle(thread);
+    } else {
+        logLine(L"Could not initialize overlay IPC mapping.");
+    }
+    const auto sessionName = frostsession::name(GetCurrentProcessId());
+    g_sessionMapping = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
+        0, sizeof(frostsession::Control), sessionName.c_str());
+    const bool sessionCreated = g_sessionMapping && GetLastError() != ERROR_ALREADY_EXISTS;
+    if (g_sessionMapping) {
+        g_sessionControl = static_cast<frostsession::Control*>(MapViewOfFile(
+            g_sessionMapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(frostsession::Control)));
+    }
+    if (g_sessionControl && sessionCreated) {
+        ZeroMemory(g_sessionControl, sizeof(*g_sessionControl));
+        g_sessionControl->layoutVersion = frostsession::version;
+        g_sessionControl->paused = 1;
+        g_sessionControl->localPauseValue = 1;
+        g_sessionControl->pauseCommandValue = 1;
+        MemoryBarrier();
+        g_sessionControl->signature = frostsession::magic;
+    }
+    if (g_sessionControl && g_sessionControl->signature == frostsession::magic &&
+        g_sessionControl->layoutVersion == frostsession::version) {
+        InterlockedExchange(&g_sessionControl->modReady, 1);
+    } else {
+        logLine(L"Could not initialize multiplayer session IPC mapping.");
+    }
     const auto mappingName = frostlaunch::name(GetCurrentProcessId());
     HANDLE mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
         0, sizeof(frostlaunch::Control), mappingName.c_str());
     if (mapping) g_launchControl = static_cast<frostlaunch::Control*>(
         MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(frostlaunch::Control)));
     if (g_launchControl) {
+        g_launchControl->layoutVersion = frostlaunch::version;
+        g_launchControl->mapIndex = -1;
+        MemoryBarrier();
         g_launchControl->signature = frostlaunch::magic;
         InterlockedExchange(&g_launchControl->state, frostlaunch::unavailable);
     }
@@ -945,6 +1673,10 @@ DWORD WINAPI workerThread(void*) {
             }
         }
         if (g_messageHook && g_launchMessage) PostThreadMessageW(g_uiThread, g_launchMessage, 0, 0);
+        // Some fullscreen SDL configurations coalesce or suppress popup-window
+        // timers. Drive both overlay windows from this persistent fallback too.
+        if (g_overlayButtonWindow) PostMessageW(g_overlayButtonWindow, WM_TIMER, 1, 0);
+        if (g_overlayWindow) PostMessageW(g_overlayWindow, WM_TIMER, 1, 0);
         if (!g_lastConfiguredPanel.load(std::memory_order_acquire)) {
             if (void* panel = locateLivePanel(kMainMenuVtableRva,
                                               kMultiplayerButtonOffset)) {

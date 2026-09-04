@@ -2,6 +2,7 @@
 #define NOMINMAX
 #include <windows.h>
 #include "../src/FrostBridgeNet/ResourceReader.h"
+#include "../src/FrostBridgeNet/CityVitals.h"
 #include <algorithm>
 #include <iostream>
 #include <map>
@@ -150,6 +151,25 @@ void tests() {
 int main(int argc, char** argv) {
     try {
         tests();
+        Memory m(standard);
+        constexpr std::uintptr_t hope = 0x500000000, discontent = 0x600000000;
+        m.put(base + 0x3FD3DE0, hope); m.put(hope, base + 0x2013278);
+        m.put(base + 0x3FD1410, discontent); m.put(discontent, base + 0x1FF0140);
+        m.put(hope + 0x2160, std::uint8_t(1)); m.put(hope + 0x2161, std::uint8_t(1));
+        m.put(discontent + 0x2198, std::uint8_t(1)); m.put(discontent + 0x2199, std::uint8_t(1));
+        m.put(hope + 0x2164, 32.0f); m.put(hope + 0x2168, std::int32_t(80));
+        m.put(discontent + 0x21E8, 20.0f); m.put(discontent + 0x21EC, std::int32_t(80));
+        auto vitals = [&] { return frostbridge::vitals::readSnapshot(
+            [&](auto a, auto d, auto n) { return m.read(a,d,n); }, base); };
+        require(vitals().hope == 4000 && vitals().discontent == 2500, "Wrong native averages");
+        m.put(hope + 0x2161, std::uint8_t(0));
+        require(vitals().hope == -1, "Disabled hope must be unavailable");
+        m.put(hope + 0x2161, std::uint8_t(1));
+        m.put(hope + 0x2164, std::numeric_limits<float>::quiet_NaN());
+        require(vitals().hope == -1, "Non-finite hope accepted");
+        m.put(discontent, base);
+        require(vitals().discontent == -1, "Wrong vitals vtable accepted");
+        std::cout << "PASS: native vitals averages, disabled/missing fields and invalid values.\n";
         // Optional read-only integration check using the production reader.
         if (argc == 3) {
             const auto pid = static_cast<DWORD>(std::stoul(argv[1]));
@@ -160,11 +180,16 @@ int main(int argc, char** argv) {
                 SIZE_T got = 0;
                 return ReadProcessMemory(process, reinterpret_cast<const void*>(a), d, n, &got) && got == n;
             }, module);
+            const auto v = frostbridge::vitals::readSnapshot([&](auto a, auto d, auto n) {
+                SIZE_T got = 0;
+                return ReadProcessMemory(process, reinterpret_cast<const void*>(a), d, n, &got) && got == n;
+            }, module);
             CloseHandle(process);
             require(s.has_value(), "Live city resources unavailable");
             std::cout << "PID " << pid << ": coal=" << s->coal << " wood=" << s->wood
                       << " steel=" << s->steel << " steamCores=" << s->steamCores
-                      << " rawFood=" << s->rawFood << " foodRations=" << s->foodRations << '\n';
+                      << " rawFood=" << s->rawFood << " foodRations=" << s->foodRations
+                      << " hope=" << v.hope / 100.0 << "% discontent=" << v.discontent / 100.0 << "%\n";
         }
         return 0;
     } catch (const std::exception& e) { std::cerr << "FAIL: " << e.what() << '\n'; return 1; }

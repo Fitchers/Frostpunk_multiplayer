@@ -1,6 +1,6 @@
 # FrostBridge network prototype
 
-The protocol is transport-independent. Version 4 is carried either by Steam P2P
+The protocol is transport-independent. Version 8 is carried either by Steam P2P
 or by a length-prefixed direct TCP connection. TCP hosting listens on a selected
 port; clients can use `127.0.0.1` for two local instances or the host's LAN IPv4.
 
@@ -20,7 +20,7 @@ official SDK integration.
 Steam packets use channel `17`; both transports start with a packed 32-byte header:
 
 - magic: `FBP1`;
-- protocol version: `4` (both peers must update; v3 packets are rejected);
+- protocol version: `8` (both peers must update; older packets are rejected);
 - message type;
 - monotonically increasing sender sequence;
 - payload size;
@@ -31,11 +31,18 @@ Implemented messages:
 
 - `Hello` / `HelloAck`: P2P handshake, required player name and city name;
 - `Heartbeat`: keeps the implicit P2P session alive;
-- `CitySnapshot`: eight packed int32 fields (32 bytes), in order: coal, wood,
-  steel, steam cores, raw food, food rations, population, temperature;
+- `CitySnapshot`: ten packed int32 fields (40 bytes), in order: coal, wood,
+  steel, steam cores, raw food, food rations, population, temperature, hope, discontent (last two in hundredths of a percent; -1 unavailable);
 - `Chat`: UTF-8 diagnostic text.
 - `StartPrepare` (6), `StartReady` (7), `StartCommit` (8), `StartResult` (9):
-  LAN-only start protocol; payload is uint32 request ID and int32 status.
+  LAN-only readiness and exact-map preparation protocol;
+- `TransferRequest` (10): transaction ID, resource kind and selected positive amount (maximum 1,000,000);
+- `TransferResult` (11): transaction ID, status and amount actually applied.
+- `PauseState` (12): bidirectional pause/resume request and optional synchronized
+  start delay;
+- `SessionState` (13): start request ID, city-loaded flag, pause flag and local
+  native 64-bit calendar time in milliseconds.
+- `StartGo` (14): commits the already matched host/client map index on both games.
 
 Steam players currently specify each other's `SteamID64`. Each side sends first,
 which implicitly accepts Steam's P2P session. Received packets are also restricted
@@ -62,11 +69,12 @@ request IDs and per-process native launch state prevent duplicate launches.
 Transport loss during commit can still result in only one game starting; this
 is not a distributed atomic transaction. Errors are surfaced in the form log.
 
-Each bridge accesses only its own game's `Local\FrostBridgeLaunchV1-PID` mapping.
+Each bridge accesses only its own game's `Local\FrostBridgeLaunchV2-PID` mapping.
 The mapping contains a signature and a state, never addresses or arbitrary calls.
 The DLL handles requests on the SDL window thread through WH_GETMESSAGE and
-advances native menu callbacks on separate ticks. It selects Endurance, then
-the first map with an enabled native Start button. DLC checks are preserved.
+advances native menu callbacks on separate ticks. The host first prepares an
+enabled Endurance map, sends its exact native index, and the client must prepare
+that same index before either side receives `StartGo`. DLC checks are preserved.
 Other settings retain native defaults. Native callbacks are version-locked.
 
 `dispatched` means the native Start callback was invoked, NOT that a city is
@@ -75,8 +83,32 @@ One automatic launch per game process is supported in this prototype.
 
 Both local and received reports use the player's handshake name:
 `Анна: ресурсы: уголь 50; древесина 30; сталь 20; паровые ядра 3; сырая еда 80; пищевые пайки 0`.
-This is the existing external connection-window chat, not an in-game overlay.
-Cities remain independent; this does not synchronize buildings or implement trade.
+Version 7 also mirrors both snapshots and names to the injected mod through a
+per-PID, pointer-free shared mapping. The injected mod draws an owned, no-activate
+`MULTIPLAYER` button under the temperature display. The button toggles the full
+resource HUD centered in the game window. The expanded panel accepts keyboard
+focus for six numeric edits and absorbs clicks so editing cannot issue city actions.
+Each field has a slider bounded by the sender's local stock, and a send button.
+
+Each process also owns `Local\FrostBridgeSessionV2-PID`. The injected mod records
+native UserPause changes and the actual calendar clock; the bridge can request only pause or
+resume, never an arbitrary call. During automatic LAN launch both cities remain
+paused until both mappings report a loaded economy. The host releases both sides
+with a 1.5-second delayed command only when their reported clocks differ by at
+most 3000 ms. `Test-SessionSync.ps1` verifies pause in both directions and that
+the host cannot release its city before the client is loaded.
+
+Each `+` initiates the amount selected in its resource's field/slider (default 1). The sender first debits its own city
+through the native `ChangeResource` wrapper on Frostpunk's UI thread. Only an
+exact requested debit is sent to the peer. A clamped partial debit is restored locally.
+The receiver credits the selected amount and returns a transaction result. Duplicate request IDs
+return the cached result without applying twice. On explicit rejection the sender
+refunds only the uncredited amount (including a partial capacity-limited credit). After an ambiguous acknowledgement timeout it deliberately does not
+refund automatically, because refunding after an unobserved successful credit
+would duplicate resources. The HUD reports this state visibly.
+
+Cities otherwise remain independent; buildings, workers and simulation are not
+synchronized.
 
 Validation on 2026-09-04:
 
