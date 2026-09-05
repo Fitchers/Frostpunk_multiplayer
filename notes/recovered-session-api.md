@@ -6,6 +6,28 @@ Read-only analysis of both live processes on 2026-09-04. Heap addresses are not 
 
 ## Pause
 
+### Shared speed (protocol 12, session IPC V4)
+
+Native selector RVA `0x11BD080` takes the time-controller pointer (`0x2B6A710`,
+vtable `0x1DFCB80`) and a mode index 0..2. It reads float multipliers at
+`0x2B70CB4`: 1, 3, 12, and updates GameplayTimer `+0xD0` plus the native UI event.
+These are the three stock speed buttons, not literal x1/x2/x3 multipliers.
+The DLL validates the prologue, calls on the game window thread and acknowledges
+only after reading back the requested mode. It never removes a pause token.
+V4 is 80 bytes: speed event sequence/value at 56/60, command sequence/value at
+64/68, acknowledgement at 72, actual current speed at 76. Event and current
+values are separate so applying an inbound command cannot erase a local input.
+The host serializes local choices and client requests into reliable, revisioned
+speedState packets. The client ignores stale revisions; applied modes do not
+generate new input events. The host publishes its initial mode after loading.
+LAN simulator tests exercise all three modes, client override, invalid values,
+simultaneous requests and lack of echo, alongside existing pause/drift tests.
+Live V4 verification in PIDs 44104/54812 applied mode 1 and mode 2 from the host,
+then mode 0 from the client. Both native current-speed fields matched after every
+command and both acknowledgement sequences matched. A subsequent three-second
+sample recorded zero new commands and zero new local events, confirming that the
+asynchronous native event is suppressed rather than echoed back over the network.
+
 ### Update 2026-09-05: timer reasons and continuous correction
 
 Anti-stutter follow-up (protocol 11): live IPC counted 20 and 19 pause-command

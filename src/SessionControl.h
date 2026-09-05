@@ -8,7 +8,7 @@
 namespace frostsession {
 
 constexpr DWORD magic = 0x31534246; // "FBS1"
-constexpr DWORD version = 3;
+constexpr DWORD version = 4;
 constexpr LONG allowedStartSkewMs = 3000;
 
 struct Control {
@@ -29,12 +29,18 @@ struct Control {
     volatile LONG pauseCommandValue = 1;
     volatile LONG pauseResultSequence = 0;
     alignas(8) volatile LONG64 gameTimeMs = 0; // actual calendar milliseconds, not local uptime
+    volatile LONG localSpeedSequence = 0;
+    volatile LONG localSpeedValue = -1; // native modes 0, 1, 2; -1 unavailable
+    volatile LONG speedCommandSequence = 0;
+    volatile LONG speedCommandValue = -1;
+    volatile LONG speedResultSequence = 0;
+    volatile LONG currentSpeed = -1;
 };
 
-static_assert(sizeof(Control) == 56);
+static_assert(sizeof(Control) == 80);
 
 inline std::wstring name(DWORD pid) {
-    return L"Local\\FrostBridgeSessionV3-" + std::to_wstring(pid);
+    return L"Local\\FrostBridgeSessionV4-" + std::to_wstring(pid);
 }
 
 } // namespace frostsession

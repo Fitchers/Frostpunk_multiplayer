@@ -7,7 +7,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 $bin = Join-Path $root 'bin'
-$staged = Join-Path $root 'artifacts\clock-map-sync'
+$staged = Join-Path $root 'artifacts\shared-speed'
 $launcher = Join-Path $bin 'FrostpunkMultiplayerLauncher.exe'
 $bridge = Join-Path $bin 'FrostBridgeNet.exe'
 $dll = Join-Path $bin 'FrostMenuMod.dll'
@@ -62,9 +62,9 @@ function Has-CurrentMod([int]$GameId) {
         $valid=$view.ReadUInt32(0)-eq[uint32]0x324F4246 -and $view.ReadUInt32(4)-eq[uint32]2
         $view.Dispose();$map.Dispose()
         if(!$valid) { return $false }
-        $map=[IO.MemoryMappedFiles.MemoryMappedFile]::OpenExisting("Local\FrostBridgeSessionV3-$GameId")
+        $map=[IO.MemoryMappedFiles.MemoryMappedFile]::OpenExisting("Local\FrostBridgeSessionV4-$GameId")
         $view=$map.CreateViewAccessor()
-        $valid=$view.ReadUInt32(0)-eq[uint32]0x31534246 -and $view.ReadUInt32(4)-eq[uint32]3
+        $valid=$view.ReadUInt32(0)-eq[uint32]0x31534246 -and $view.ReadUInt32(4)-eq[uint32]4
         $view.Dispose();$map.Dispose(); return $valid
     } catch { return $false }
 }

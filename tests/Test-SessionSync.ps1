@@ -16,9 +16,9 @@ function Start-Bridge([string[]]$Arguments) {
 }
 try {
  foreach($id in 4100000001,4100000002) {
-  $map=[IO.MemoryMappedFiles.MemoryMappedFile]::CreateNew("Local\FrostBridgeSessionV3-$id",56)
+  $map=[IO.MemoryMappedFiles.MemoryMappedFile]::CreateNew("Local\FrostBridgeSessionV4-$id",80)
   $view=$map.CreateViewAccessor()
-  $view.Write(0,[uint32]0x31534246); $view.Write(4,[uint32]3); $view.Write(8,[int]1)
+  $view.Write(0,[uint32]0x31534246); $view.Write(4,[uint32]4); $view.Write(8,[int]1)
   $view.Write(12,[int]1); $view.Write(16,[int]0)
   $maps+=,$map; $views+=,$view
   $launch=[IO.MemoryMappedFiles.MemoryMappedFile]::CreateNew("Local\FrostBridgeLaunchV3-$id",16)
@@ -33,6 +33,24 @@ try {
  $guest=Start-Bridge @('--lan-join',"127.0.0.1:$port",'--name','Guest','--pid','4100000002')
  $children+=,$guest; $guestOut=$guest.StandardOutput.ReadToEndAsync()
  Start-Sleep -Seconds 1
+
+ # All native speed modes, requests in both directions and no repeated echo.
+ $views[0].Write(60,[int]1); $views[0].Write(56,[int]1)
+ Wait-Until { $views[1].ReadInt32(68) -eq 1 } 'host middle speed reaches guest'
+ $views[0].Write(60,[int]2); $views[0].Write(56,[int]2)
+ Wait-Until { $views[1].ReadInt32(68) -eq 2 } 'host fastest speed reaches guest'
+ $views[1].Write(60,[int]0); $views[1].Write(56,[int]1)
+ Wait-Until { $views[0].ReadInt32(68) -eq 0 -and $views[1].ReadInt32(68) -eq 0 } 'guest normal speed reaches both'
+ $speedSeq=$views[0].ReadInt32(64)
+ Start-Sleep -Milliseconds 200
+ if($views[0].ReadInt32(64) -ne $speedSeq) { throw 'Speed echo loop' }
+ $views[1].Write(60,[int]7); $views[1].Write(56,[int]2)
+ Start-Sleep -Milliseconds 200
+ if($views[0].ReadInt32(64) -ne $speedSeq) { throw 'Invalid speed accepted' }
+ $views[0].Write(60,[int]1); $views[0].Write(56,[int]3)
+ $views[1].Write(60,[int]2); $views[1].Write(56,[int]3)
+ Start-Sleep -Milliseconds 300
+ if($views[0].ReadInt32(68) -ne $views[1].ReadInt32(68)) { throw 'Concurrent speed choices diverged' }
 
  # A pause/resume input from either game must become a command for its peer.
  $views[0].Write(32,[int]1); $views[0].Write(28,[int]1)

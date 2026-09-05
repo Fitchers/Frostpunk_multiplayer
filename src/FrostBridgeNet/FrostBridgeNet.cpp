@@ -34,7 +34,7 @@
 namespace {
 
 constexpr std::uint32_t kProtocolMagic = 0x31504246;  // "FBP1"
-constexpr std::uint16_t kProtocolVersion = 11;
+constexpr std::uint16_t kProtocolVersion = 12;
 constexpr int kChannel = 17;
 constexpr int kSendUnreliable = 0;
 constexpr int kSendReliable = 2;
@@ -57,6 +57,8 @@ enum class MessageType : std::uint16_t {
     pauseState = 12,
     sessionState = 13,
     startGo = 14,
+    speedRequest = 15,
+    speedState = 16,
 };
 
 #pragma pack(push, 1)
@@ -100,6 +102,10 @@ struct PausePayload {
     std::uint32_t request = 0;
     std::int32_t paused = 1;
     std::uint32_t delayMs = 0;
+};
+struct SpeedPayload {
+    std::uint32_t revision = 0;
+    std::int32_t mode = -1;
 };
 
 struct SessionStatePayload {
@@ -425,6 +431,9 @@ public:
             control_->paused = 1;
             control_->localPauseValue = 1;
             control_->pauseCommandValue = 1;
+            control_->localSpeedValue = -1;
+            control_->currentSpeed = -1;
+            control_->speedCommandValue = -1;
             MemoryBarrier();
             control_->signature = frostsession::magic;
         }
@@ -435,6 +444,7 @@ public:
         }
         lastPauseEvent_ = InterlockedCompareExchange(
             &control_->localPauseSequence, 0, 0);
+        lastSpeedEvent_ = InterlockedCompareExchange(&control_->localSpeedSequence, 0, 0);
     }
     void close() {
         if (control_) UnmapViewOfFile(control_);
@@ -472,11 +482,28 @@ public:
         MemoryBarrier();
         return InterlockedIncrement(&control_->pauseCommandSequence);
     }
+    int speed() const { return control_ ? control_->currentSpeed : -1; }
+    std::optional<int> localSpeedEvent() {
+        if (!control_) return std::nullopt;
+        const LONG sequence = InterlockedCompareExchange(&control_->localSpeedSequence, 0, 0);
+        if (sequence == lastSpeedEvent_) return std::nullopt;
+        lastSpeedEvent_ = sequence;
+        MemoryBarrier();
+        const int mode = control_->localSpeedValue;
+        return mode >= 0 && mode <= 2 ? std::optional<int>(mode) : std::nullopt;
+    }
+    void commandSpeed(int mode) {
+        if (!control_ || mode < 0 || mode > 2) return;
+        InterlockedExchange(&control_->speedCommandValue, mode);
+        MemoryBarrier();
+        InterlockedIncrement(&control_->speedCommandSequence);
+    }
 
 private:
     HANDLE mapping_ = nullptr;
     frostsession::Control* control_ = nullptr;
     LONG lastPauseEvent_ = 0;
+    LONG lastSpeedEvent_ = 0;
 };
 
 class SteamApi {
@@ -1283,6 +1310,31 @@ private:
         const PausePayload payload{request, paused ? 1 : 0, delayMs};
         sendPacket(makePacket(MessageType::pauseState, ++sequence_, local_, payload), true);
     }
+    void sendSpeed(MessageType type, int mode, std::uint32_t revision = 0) {
+        const SpeedPayload payload{revision, mode};
+        sendPacket(makePacket(type, ++sequence_, local_, payload), true);
+    }
+    void commitSpeed(int mode) {
+        if (mode < 0 || mode > 2) return;
+        // The host orders both players' inputs so simultaneous clicks converge.
+        sharedSpeed_ = mode;
+        ++speedRevision_;
+        gameSession_.commandSpeed(mode);
+        clockCorrection_.reset();
+        sendSpeed(MessageType::speedState, mode, speedRevision_);
+    }
+    void receiveSpeed(MessageType type, const SpeedPayload& speed) {
+        if (speed.mode < 0 || speed.mode > 2) return;
+        if (host_ && type == MessageType::speedRequest && !speed.revision) {
+            commitSpeed(speed.mode);
+        } else if (!host_ && type == MessageType::speedState &&
+                   speed.revision && speed.revision > speedRevision_) {
+            speedRevision_ = speed.revision;
+            sharedSpeed_ = speed.mode;
+            gameSession_.commandSpeed(speed.mode);
+            clockCorrection_.reset();
+        }
+    }
 
     void receivePause(const PausePayload& pause) {
         if (pause.paused != 0 && pause.paused != 1) return;
@@ -1320,6 +1372,15 @@ private:
 
     void pollGameSession(const std::chrono::steady_clock::time_point now) {
         const auto localState = gameSession_.state();
+        const auto speed = gameSession_.localSpeedEvent();
+        if (connected_) {
+            if (speed) {
+                if (host_) commitSpeed(*speed);
+                else sendSpeed(MessageType::speedRequest, *speed);
+            } else if (host_ && !speedRevision_ && localState.loaded && gameSession_.speed() >= 0) {
+                commitSpeed(gameSession_.speed());
+            }
+        }
         if (pendingPause_.active && now >= pendingPause_.deadline) {
             gameSession_.commandPause(pendingPause_.paused || peerPauseRequested_ || clockHold_);
             pendingPause_ = {};
@@ -1605,6 +1666,7 @@ private:
                 if (header.type == MessageType::hello) sendHello(MessageType::helloAck);
                 overlay_.connected(playerName_, peerName_);
                 sendPause(gameSession_.localPause());
+                if (host_ && speedRevision_) sendSpeed(MessageType::speedState, sharedSpeed_, speedRevision_);
             } else if (connected_ &&
                        ((header.type >= MessageType::startPrepare &&
                          header.type <= MessageType::startResult) ||
@@ -1631,6 +1693,11 @@ private:
                 TransferResultPayload result{};
                 std::memcpy(&result, payload, sizeof(result));
                 receiveTransferResult(result);
+            } else if (connected_ && (header.type == MessageType::speedRequest ||
+                       header.type == MessageType::speedState) && header.payloadBytes == sizeof(SpeedPayload)) {
+                SpeedPayload speed{};
+                std::memcpy(&speed, payload, sizeof(speed));
+                receiveSpeed(header.type, speed);
             } else if (connected_ && header.type == MessageType::pauseState &&
                        header.payloadBytes == sizeof(PausePayload)) {
                 PausePayload pause{};
@@ -1752,6 +1819,8 @@ private:
     std::optional<SessionStatePayload> peerSession_;
     std::chrono::steady_clock::time_point peerSessionReceived_{};
     bool clockHold_ = false;
+    std::uint32_t speedRevision_ = 0;
+    int sharedSpeed_ = -1;
     frostsync::ClockCorrection clockCorrection_;
     bool clockWaitReported_ = false;
     bool sessionBarrierReleased_ = false;

@@ -159,6 +159,11 @@ bool g_updatingAmounts = false;
 HANDLE g_sessionMapping = nullptr;
 frostsession::Control* g_sessionControl = nullptr;
 LONG g_lastPauseCommand = 0;
+LONG g_lastSpeedCommand = 0;
+int g_lastNativeSpeed = -1;
+LONG g_pendingSpeedCommand = 0;
+int g_pendingSpeedMode = -1;
+ULONGLONG g_pendingSpeedRetry = 0;
 bool g_sessionLoaded = false;
 bool g_sessionPaused = true;
 bool g_pendingInitialPause = false;
@@ -736,6 +741,71 @@ void observeSessionInput(const MSG&) {
     // Coordinates/key guesses used to report a pause which had never happened.
 }
 
+int nativeSpeed() {
+    std::uintptr_t timer = 0;
+    bool local = false, network = false;
+    float current = 0, modes[3]{};
+    if (!readTimerPause(timer, local, network) ||
+        !safeCopyMemory(timer + 0xD0, &current, sizeof(current)) ||
+        !safeCopyMemory(g_gameBase + 0x2B70CB4, modes, sizeof(modes))) return -1;
+    for (int i = 0; i < 3; ++i)
+        if (modes[i] > 0 && modes[i] <= 1000 && current == modes[i]) return i;
+    return -1;
+}
+
+bool applyNativeSpeed(int mode) {
+    if (mode < 0 || mode > 2) return false;
+    std::uintptr_t object = 0;
+    bool paused = false;
+    LONG64 time = 0;
+    if (!nativeTimeState(object, paused, time)) return false;
+    constexpr unsigned char expected[]{0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20};
+    unsigned char code[sizeof(expected)]{};
+    if (!safeCopyMemory(g_gameBase + 0x11BD080, code, sizeof(code)) ||
+        std::memcmp(code, expected, sizeof(code))) return false;
+    __try {
+        using SetSpeed = void(__fastcall*)(void*, int);
+        reinterpret_cast<SetSpeed>(g_gameBase + 0x11BD080)(reinterpret_cast<void*>(object), mode);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    return true; // the engine publishes and applies the speed event asynchronously
+}
+
+void advanceSpeedControl(bool connected) {
+    int speed = nativeSpeed();
+    if (speed < 0) return;
+    InterlockedExchange(&g_sessionControl->currentSpeed, speed);
+    if (g_pendingSpeedCommand) {
+        if (speed == g_pendingSpeedMode) {
+            g_lastNativeSpeed = speed;
+            g_lastSpeedCommand = g_pendingSpeedCommand;
+            InterlockedExchange(&g_sessionControl->speedResultSequence, g_pendingSpeedCommand);
+            g_pendingSpeedCommand = 0;
+            g_pendingSpeedMode = -1;
+        } else if (GetTickCount64() >= g_pendingSpeedRetry && applyNativeSpeed(g_pendingSpeedMode)) {
+            g_pendingSpeedRetry = GetTickCount64() + 500;
+        }
+        return; // an inbound engine event must never become outbound player input
+    }
+    // Observe player input before applying commands. Do not echo applied changes
+    // or treat the initial city speed as a new client request.
+    if (g_lastNativeSpeed >= 0 && speed != g_lastNativeSpeed) {
+        InterlockedExchange(&g_sessionControl->localSpeedValue, speed);
+        MemoryBarrier();
+        InterlockedIncrement(&g_sessionControl->localSpeedSequence);
+    }
+    g_lastNativeSpeed = speed;
+    const LONG sequence = InterlockedCompareExchange(&g_sessionControl->speedCommandSequence, 0, 0);
+    if (connected && sequence && sequence != g_lastSpeedCommand) {
+        MemoryBarrier();
+        const int requested = g_sessionControl->speedCommandValue;
+        if (applyNativeSpeed(requested)) {
+            g_pendingSpeedCommand = sequence;
+            g_pendingSpeedMode = requested;
+            g_pendingSpeedRetry = GetTickCount64() + 500;
+        }
+    }
+}
+
 void advanceSessionControl() {
     if (!g_sessionControl || g_sessionControl->signature != frostsession::magic ||
         g_sessionControl->layoutVersion != frostsession::version) return;
@@ -753,6 +823,11 @@ void advanceSessionControl() {
             // Publish loaded only after native pause/time can actually be read.
             if (!loaded) {
                 InterlockedExchange(&g_sessionControl->gameLoaded, 0);
+                InterlockedExchange(&g_sessionControl->localSpeedValue, -1);
+                InterlockedExchange(&g_sessionControl->currentSpeed, -1);
+                g_lastNativeSpeed = -1;
+                g_pendingSpeedCommand = 0;
+                g_pendingSpeedMode = -1;
                 g_pendingInitialPause = false;
             }
             InterlockedIncrement(&g_sessionControl->loadGeneration);
@@ -764,6 +839,7 @@ void advanceSessionControl() {
             static_cast<LONG>(frostoverlay::Connection::connected);
     const LONG sequence = InterlockedCompareExchange(
         &g_sessionControl->pauseCommandSequence, 0, 0);
+    advanceSpeedControl(connected);
     if (justLoaded && connected) g_pendingInitialPause = true;
     if (!connected) {
         applyNativePause(false); // Release only our reason when the bridge disconnects.
@@ -1708,6 +1784,9 @@ DWORD WINAPI workerThread(void*) {
         g_sessionControl->paused = 1;
         g_sessionControl->localPauseValue = 1;
         g_sessionControl->pauseCommandValue = 1;
+        g_sessionControl->localSpeedValue = -1;
+        g_sessionControl->currentSpeed = -1;
+        g_sessionControl->speedCommandValue = -1;
         MemoryBarrier();
         g_sessionControl->signature = frostsession::magic;
     }
