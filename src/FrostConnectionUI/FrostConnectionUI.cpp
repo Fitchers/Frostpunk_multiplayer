@@ -16,15 +16,30 @@ constexpr int kName=101, kAddress=102, kPort=103, kHost=104, kJoin=105,
               kStop=106, kLog=107, kStatus=108, kChat=109, kSend=110, kStart=111,
               kSaveName=112,kSave=113,kLoad=114,kStory=115;
 constexpr wchar_t kClass[] = L"FrostBridgeConnectionUI";
+constexpr UINT kCloseForTransportSwitch=WM_APP+42;
 HWND g_window{};
 HFONT g_font{};
 bool g_steam=false;
+DWORD g_pid=0;
+bool g_menuOverlay=false;
+bool g_panelOpen=true;
+HWND g_gameWindow{};
+HBRUSH g_panelBrush=CreateSolidBrush(RGB(17,25,31));
+HWND findOwner() {
+    HWND result=nullptr;
+    EnumWindows([](HWND window,LPARAM param)->BOOL {
+        DWORD pid=0; GetWindowThreadProcessId(window,&pid);
+        wchar_t cls[64]{}; GetClassNameW(window,cls,64);
+        if(pid==g_pid && wcscmp(cls,L"SDL_app")==0) { *reinterpret_cast<HWND*>(param)=window; return FALSE; }
+        return TRUE;
+    },reinterpret_cast<LPARAM>(&result));
+    return result;
+}
 bool g_host=false, g_connected=false, g_startPending=false;
 std::wstring g_initialName;
 std::wstring g_initialAddress=L"127.0.0.1";
 std::wstring g_initialPort=L"27020";
 int g_autoAction=0; // 1 host, 2 join
-DWORD g_pid=0;
 HANDLE g_game{};
 std::unique_ptr<frostbridge::ConnectionSession> g_session;
 
@@ -77,11 +92,21 @@ void stopSession() {
 void pumpOutput() {
     if(!g_session) return;
     for(const auto& line : g_session->takeOutput()) {
-            log(fromUtf8(line));
-            if(line=="[role] host" || line=="[role] client") { g_host=line=="[role] host"; controls(true); }
+            bool show=line.rfind("[you] ",0)==0 || line.rfind("[save]",0)==0 || line.rfind("[trade]",0)==0 ||
+                line.rfind("[game]",0)==0 || line.rfind("error:",0)==0 ||
+                line.rfind("[connection]",0)==0;
+            if(line=="[role] host" || line=="[role] client") {
+                g_host=line=="[role] host"; controls(true);
+                status(g_host?L"Вы — хост. Можно выбрать режим и начать игру.":L"Вы — клиент. Ждём запуска игры хостом.");
+                log(g_host?L"Роль: вы хост.":L"Роль: вы клиент.");
+            }
             if(line.rfind("[peer] player:",0)==0) {
+                const bool first=!g_connected;
                 g_connected=true; controls(true);
                 status(g_host?L"Игрок подключён. Нажмите «Начать игру».":L"Подключено. Ждём, когда хост начнёт игру.");
+                if(first) log(L"Второй игрок подключён.");
+            } else if(line.rfind("[peer] ",0)==0) {
+                show=true;
             }
             if(line.rfind("[game] rejected:",0)==0) {
                 g_startPending=false; controls(true); status(L"Запуск отменён — подробности в чате");
@@ -89,12 +114,19 @@ void pumpOutput() {
             if(line.rfind("[game] launching:",0)==0 || line.rfind("[game] loading:",0)==0)
                 status(L"Карта запускается. Окно чата можно свернуть.");
             if(line.rfind("[game] failed:",0)==0 || line.rfind("[game] peer-failed:",0)==0)
-                status(L"Ошибка запуска города — подробности в чате");
+                { g_startPending=false; controls(true); status(L"Выбор карты отменён или запуск не удался"); }
+            if(line.rfind("[save] Waiting",0)==0)
+                status(L"Сохранение или загрузка выполняется на обоих компьютерах…");
+            if(line.rfind("[save] Checkpoint complete",0)==0)
+                status(L"Готово. Сохранение доступно под именем с _multiplayer.");
+            if(line.rfind("[save] Failed",0)==0 || line.rfind("[save] Disconnected",0)==0)
+                status(L"Сохранение или загрузка не выполнена — смотрите сообщение ниже");
             if(line.rfind("[connection] disconnected",0)==0) {
                 g_connected=false; controls(true);
                 status(L"Соединение закрыто. Нажмите «Отключиться» для нового подключения.");
             }
             if(line.rfind("error:",0)==0) status(L"Ошибка подключения — подробности ниже");
+            if(show) log(fromUtf8(line));
     }
 }
 void startSession(bool host) {
@@ -139,9 +171,10 @@ LRESULT CALLBACK windowProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
         control(L"EDIT",g_steam?L"":g_initialAddress.c_str(),kAddress,170,96,320,30,WS_TABSTOP|ES_AUTOHSCROLL);
         control(L"STATIC",L"Порт",0,504,100,45,24);
         control(L"EDIT",g_initialPort.c_str(),kPort,553,96,107,30,WS_TABSTOP|ES_NUMBER);
-        control(L"STATIC",g_steam?L"Оба игрока вводят SteamID64 друг друга. AppID 480.":L"На одном ПК: 127.0.0.1. На другом ПК: локальный IPv4 хоста.",0,20,140,650,24);
+        control(L"STATIC",g_steam?L"Оба вводят SteamID64 друг друга. Кто подключился первым — тот хост.":L"На одном ПК: 127.0.0.1. На другом ПК: локальный IPv4 хоста.",0,20,140,650,24);
         control(L"BUTTON",L"Создать",kHost,20,177,180,34,WS_TABSTOP);
-        control(L"BUTTON",L"Подключиться",kJoin,217,177,220,34,WS_TABSTOP);
+        if(g_steam) ShowWindow(GetDlgItem(window,kHost),SW_HIDE);
+        control(L"BUTTON",g_steam?L"Подключиться (автовыбор хоста)":L"Подключиться",kJoin,g_steam?20:217,177,g_steam?417:220,34,WS_TABSTOP);
         control(L"BUTTON",L"Отключиться",kStop,454,177,206,34,WS_TABSTOP);
         control(L"STATIC",L"Введите имя и выберите действие",kStatus,20,220,260,52);
         control(L"BUTTON",L"Бесконечный",kStart,290,225,180,38,WS_TABSTOP);
@@ -153,6 +186,7 @@ LRESULT CALLBACK windowProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
         control(L"EDIT",L"",kLog,20,342,640,183,WS_VSCROLL|ES_MULTILINE|ES_READONLY|ES_AUTOVSCROLL);
         control(L"EDIT",L"",kChat,20,539,480,30,WS_TABSTOP|ES_AUTOHSCROLL);
         control(L"BUTTON",L"Отправить",kSend,515,539,145,30,WS_TABSTOP);
+        if(g_menuOverlay) control(L"BUTTON",L"Свернуть",116,550,8,110,30,WS_TABSTOP);
         control(L"STATIC",L"Окно можно свернуть и продолжить игру. Закрытие отключает сессию.",0,20,582,655,25);
         SendDlgItemMessageW(window,kName,EM_SETLIMITTEXT,63,0);
         SendDlgItemMessageW(window,kAddress,EM_SETLIMITTEXT,253,0);
@@ -167,6 +201,7 @@ LRESULT CALLBACK windowProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
         if(HIWORD(wp)!=BN_CLICKED) break;
         try {
             switch(LOWORD(wp)) {
+            case 116: g_panelOpen=false; ShowWindow(window,SW_HIDE); break;
             case kHost: startSession(true); break;
             case kJoin: startSession(false); break;
             case kSave:
@@ -179,6 +214,7 @@ LRESULT CALLBACK windowProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
             case kStart: {
                 if (!g_session || !g_host || !g_connected || g_startPending) break;
                 g_session->send(LOWORD(wp) == kStory ? "start story" : "start");
+                if(g_menuOverlay) { g_panelOpen=false; ShowWindow(window,SW_HIDE); }
                 g_startPending=true; controls(true); status(L"Проверка готовности двух игр…");
                 break;
             }
@@ -193,7 +229,28 @@ LRESULT CALLBACK windowProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
             }
         } catch(const std::exception& error) { status(L"Ошибка — проверьте параметры"); log(fromUtf8(error.what())); }
         return 0;
+    case WM_CTLCOLORSTATIC:
+        if(g_menuOverlay) {
+            SetTextColor(reinterpret_cast<HDC>(wp),RGB(237,202,115));
+            SetBkColor(reinterpret_cast<HDC>(wp),RGB(17,25,31));
+            return reinterpret_cast<LRESULT>(g_panelBrush);
+        }
+        break;
+    case WM_SHOWWINDOW:
+        if(wp) g_panelOpen=true;
+        break;
     case WM_TIMER:
+        if(g_menuOverlay && g_gameWindow) {
+            DWORD foregroundPid=0; GetWindowThreadProcessId(GetForegroundWindow(),&foregroundPid);
+            if(!g_panelOpen || IsIconic(g_gameWindow) || (foregroundPid!=g_pid && foregroundPid!=GetCurrentProcessId())) {
+                ShowWindow(window,SW_HIDE);
+            } else {
+                RECT rect{}; GetClientRect(g_gameWindow,&rect);
+                POINT origin{}; ClientToScreen(g_gameWindow,&origin);
+                SetWindowPos(window,HWND_TOPMOST,origin.x+(rect.right-680)/2,
+                    origin.y+(rect.bottom-620)/2,680,620,SWP_NOACTIVATE|SWP_SHOWWINDOW);
+            }
+        }
         pumpOutput();
         if(g_session&&g_session->finished()) {
             const bool failed=g_session->failed();
@@ -205,7 +262,10 @@ LRESULT CALLBACK windowProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
         }
         return 0;
     case WM_CLOSE:
+        if(g_menuOverlay) { g_panelOpen=false; ShowWindow(window,SW_HIDE); return 0; }
         if(g_session&&MessageBoxW(window,L"Отключить сетевую сессию и закрыть окно?",L"FrostBridge",MB_YESNO|MB_ICONQUESTION)!=IDYES) return 0;
+        DestroyWindow(window); return 0;
+    case kCloseForTransportSwitch:
         DestroyWindow(window); return 0;
     case WM_DESTROY:
         KillTimer(window,1); stopSession(); closeHandle(g_game);
@@ -218,7 +278,8 @@ int frostbridge::runConnectionUI(const std::vector<std::wstring>& args) {
     try {
         const HINSTANCE instance=GetModuleHandleW(nullptr);
         for(std::size_t i=0;i<args.size();++i) {
-            if(args[i]==L"--steam") g_steam=true;
+            if(args[i]==L"--overlay") g_menuOverlay=true;
+            else if(args[i]==L"--steam") g_steam=true;
             else if(args[i]==L"--lan") g_steam=false;
             else if(args[i]==L"--name"&&i+1<args.size()) g_initialName=args[++i];
             else if(args[i]==L"--address"&&i+1<args.size()) g_initialAddress=args[++i];
@@ -237,16 +298,22 @@ int frostbridge::runConnectionUI(const std::vector<std::wstring>& args) {
         const auto title=std::wstring(L"FrostBridge — ")+(g_steam?L"Steam":L"LAN")+L" — PID "+std::to_wstring(g_pid);
         // One UI/bridge per city, including when called again from the menu.
         const auto mutexName=L"Local\\FrostBridgeUI-"+std::to_wstring(g_pid);
-        HANDLE mutex=CreateMutexW(nullptr,FALSE,mutexName.c_str());
-        if(!mutex) throw std::runtime_error("Не удалось создать блокировку сессии.");
-        if(GetLastError()==ERROR_ALREADY_EXISTS) {
-            // Transport may differ; find the existing form for the same city.
+        HANDLE mutex=nullptr;
+        for(int attempt=0;attempt<80;++attempt) {
+            mutex=CreateMutexW(nullptr,FALSE,mutexName.c_str());
+            if(!mutex) throw std::runtime_error("Не удалось создать блокировку сессии.");
+            if(GetLastError()!=ERROR_ALREADY_EXISTS) break;
             for(const auto* transport:{L"Steam",L"LAN"}) {
                 const auto other=L"FrostBridge — "+std::wstring(transport)+L" — PID "+std::to_wstring(g_pid);
-                if(HWND window=FindWindowW(kClass,other.c_str())) { ShowWindow(window,SW_RESTORE); SetForegroundWindow(window); }
+                if(HWND existing=FindWindowW(kClass,other.c_str())) {
+                    ShowWindow(existing,SW_RESTORE); SetForegroundWindow(existing);
+                    CloseHandle(mutex); return 0;
+                }
             }
-            CloseHandle(mutex); return 0;
+            CloseHandle(mutex); mutex=nullptr;
+            Sleep(25); // previous transport is between DestroyWindow and process exit
         }
+        if(!mutex) throw std::runtime_error("Предыдущее окно подключения ещё закрывается. Повторите попытку.");
         if(g_pid) {
             g_game=OpenProcess(SYNCHRONIZE|PROCESS_QUERY_LIMITED_INFORMATION,FALSE,g_pid);
             wchar_t path[32768]{}; DWORD size=32768;
@@ -255,11 +322,13 @@ int frostbridge::runConnectionUI(const std::vector<std::wstring>& args) {
                 throw std::runtime_error("Выбранный PID не является доступным процессом Frostpunk.");
         }
         WNDCLASSW cls{}; cls.lpfnWndProc=windowProc; cls.hInstance=instance;
-        cls.lpszClassName=kClass; cls.hCursor=LoadCursorW(nullptr,IDC_ARROW); cls.hbrBackground=reinterpret_cast<HBRUSH>(COLOR_WINDOW+1);
+        cls.lpszClassName=kClass; cls.hCursor=LoadCursorW(nullptr,IDC_ARROW); cls.hbrBackground=g_menuOverlay?g_panelBrush:reinterpret_cast<HBRUSH>(COLOR_WINDOW+1);
         RegisterClassW(&cls);
         RECT rect{0,0,680,620}; AdjustWindowRect(&rect,WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX,FALSE);
-        HWND window=CreateWindowW(kClass,title.c_str(),WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX,
-            CW_USEDEFAULT,CW_USEDEFAULT,rect.right-rect.left,rect.bottom-rect.top,nullptr,nullptr,instance,nullptr);
+        g_gameWindow=g_menuOverlay?findOwner():nullptr;
+        HWND window=CreateWindowExW(g_menuOverlay?WS_EX_TOOLWINDOW:0,kClass,title.c_str(),
+            g_menuOverlay?WS_POPUP:(WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX),
+            CW_USEDEFAULT,CW_USEDEFAULT,rect.right-rect.left,rect.bottom-rect.top,g_gameWindow,nullptr,instance,nullptr);
         if(!window) throw std::runtime_error("Не удалось открыть окно подключения.");
         ShowWindow(window,SW_SHOW); SetFocus(GetDlgItem(window,kName));
         MSG message{};

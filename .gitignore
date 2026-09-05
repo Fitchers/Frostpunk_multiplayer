@@ -1,5 +1,6 @@
 artifacts/
 bin/
+dist/
 *.obj
 *.dmp
 *.log

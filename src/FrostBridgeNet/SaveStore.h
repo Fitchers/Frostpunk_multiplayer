@@ -113,6 +113,11 @@ public:
     }
     void commit(const std::wstring& slot) {
         std::filesystem::rename(folder(slot)/L"pending",folder(slot)/L"complete");
+        // Keep a normal public Frostpunk save beside the private multiplayer
+        // archive. This is what makes <name>_multiplayer visible in Load Game.
+        const auto publicFile=native_/(slot+L".save");
+        if(!std::filesystem::exists(publicFile))
+            std::filesystem::copy_file(folder(slot)/(slot+L".save"),publicFile);
     }
     Record read(const std::wstring& slot) const {
         Record r{};

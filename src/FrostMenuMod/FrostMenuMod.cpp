@@ -50,6 +50,7 @@ constexpr std::size_t kUiElementTransformOffset = 0xC0;
 constexpr std::size_t kUiElementFirstChildOffset = 0x220;
 constexpr std::size_t kUiElementNextSiblingOffset = 0x240;
 constexpr float kInitialMultiplayerTitleOffset = 48.0f;
+constexpr UINT kCloseForTransportSwitch=WM_APP+42;
 constexpr std::uint32_t kMultiplayerSourcePanelId = 0x61;
 constexpr std::uint32_t kScenariosPanelId = 0x5B;
 
@@ -152,6 +153,7 @@ HANDLE g_overlayMapping = nullptr;
 frostoverlay::Control* g_overlayControl = nullptr;
 HWND g_overlayWindow = nullptr;
 HWND g_overlayButtonWindow = nullptr;
+HWND g_sessionButtonWindow = nullptr;
 std::atomic<bool> g_overlayExpanded = false;
 LONG g_lastApplySequence = 0;
 RECT g_plusButtons[frostoverlay::resourceCount]{};
@@ -1307,6 +1309,8 @@ LRESULT CALLBACK overlayWindowProc(HWND window, UINT message, WPARAM wp, LPARAM 
     return DefWindowProcW(window, message, wp, lp);
 }
 
+void openConnectionForm(int index);
+
 LRESULT CALLBACK overlayButtonWindowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     switch (message) {
     case WM_NCHITTEST:
@@ -1314,6 +1318,11 @@ LRESULT CALLBACK overlayButtonWindowProc(HWND window, UINT message, WPARAM wp, L
     case WM_MOUSEACTIVATE:
         return MA_NOACTIVATE;
     case WM_LBUTTONUP:
+        if(window==g_sessionButtonWindow) {
+            const int selected=g_selectedConnection.load(std::memory_order_acquire);
+            openConnectionForm(selected>=0 && selected<=1?selected:0);
+            return 0;
+        }
         g_overlayExpanded.store(!g_overlayExpanded.load(std::memory_order_acquire),
                                 std::memory_order_release);
         InvalidateRect(window, nullptr, FALSE);
@@ -1349,8 +1358,12 @@ LRESULT CALLBACK overlayButtonWindowProc(HWND window, UINT message, WPARAM wp, L
             GetClientRect(game, &client);
             POINT origin{};
             ClientToScreen(game, &origin);
-            constexpr int width = 166, height = 30;
-            const int x = origin.x + client.right / 2 - width / 2;
+            const bool sessionButton=window==g_sessionButtonWindow;
+            const int width = sessionButton?190:166, height = 30;
+            constexpr int gap=8;
+            const int total=166+gap+190;
+            const int x = origin.x + client.right / 2 - total / 2 +
+                (sessionButton?166+gap:0);
             const int y = origin.y + 128;
             placeOverlayWindow(window, x, y, width, height);
         }
@@ -1376,7 +1389,7 @@ LRESULT CALLBACK overlayButtonWindowProc(HWND window, UINT message, WPARAM wp, L
         HGDIOBJ oldFont = SelectObject(dc, font);
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, RGB(246, 197, 70));
-        DrawTextW(dc, L"MULTIPLAYER", -1, &client,
+        DrawTextW(dc, window==g_sessionButtonWindow?L"CHAT/SAVE":L"TRADE", -1, &client,
                   DT_CENTER | DT_SINGLELINE | DT_VCENTER);
         SelectObject(dc, oldFont);
         DeleteObject(font);
@@ -1429,8 +1442,22 @@ DWORD WINAPI overlayThread(void*) {
         return 1;
     }
     SetLayeredWindowAttributes(g_overlayButtonWindow, 0, 225, LWA_ALPHA);
+    g_sessionButtonWindow = CreateWindowExW(
+        WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        buttonClass.lpszClassName, L"FrostBridge Session", WS_POPUP,
+        0, 0, 190, 30, owner, nullptr, g_module, nullptr);
+    if (!g_sessionButtonWindow) {
+        logLine(L"Could not create in-game chat/save button.");
+        DestroyWindow(g_overlayButtonWindow);
+        g_overlayButtonWindow = nullptr;
+        DestroyWindow(g_overlayWindow);
+        g_overlayWindow = nullptr;
+        return 1;
+    }
+    SetLayeredWindowAttributes(g_sessionButtonWindow, 0, 225, LWA_ALPHA);
     SetTimer(g_overlayWindow, 1, 100, nullptr);
     SetTimer(g_overlayButtonWindow, 1, 100, nullptr);
+    SetTimer(g_sessionButtonWindow, 1, 100, nullptr);
     logLine(L"In-game multiplayer resource overlay initialized.");
     MSG message{};
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
@@ -1449,7 +1476,16 @@ DWORD WINAPI showConnectionDialog(void* selected) {
         *separator = L'\0';
         const std::wstring directory(path);
         const std::wstring executable = directory + L"\\FrostBridgeNet.exe";
-        std::wstring command = L"\"" + executable + L"\" --ui " +
+        const auto otherTitle = L"FrostBridge — " + std::wstring(lan?L"Steam":L"LAN") +
+            L" — PID " + std::to_wstring(GetCurrentProcessId());
+        if(HWND other=FindWindowW(L"FrostBridgeConnectionUI",otherTitle.c_str())) {
+            DWORD_PTR ignored=0;
+            SendMessageTimeoutW(other,kCloseForTransportSwitch,0,0,
+                SMTO_ABORTIFHUNG,2000,&ignored);
+            for(int attempt=0;attempt<100 &&
+                FindWindowW(L"FrostBridgeConnectionUI",otherTitle.c_str());++attempt) Sleep(10);
+        }
+        std::wstring command = L"\"" + executable + L"\" --ui --overlay " +
             (lan ? L"--lan" : L"--steam") + L" --pid " +
             std::to_wstring(GetCurrentProcessId());
         STARTUPINFOW startup{};
@@ -1481,14 +1517,12 @@ void openConnectionForm(int index) {
     if (index < 0 || index > 1) return;
     // A form may be behind the game or minimized. Restore it directly from
     // the input-owning game instead of requiring another confirmation click.
-    for (const auto* transport : {L"LAN", L"Steam"}) {
-        const auto title = L"FrostBridge — " + std::wstring(transport) +
-            L" — PID " + std::to_wstring(GetCurrentProcessId());
-        if (HWND window = FindWindowW(L"FrostBridgeConnectionUI", title.c_str())) {
-            ShowWindow(window, SW_RESTORE);
-            SetForegroundWindow(window);
-            return;
-        }
+    const auto title = L"FrostBridge — " + std::wstring(index?L"LAN":L"Steam") +
+        L" — PID " + std::to_wstring(GetCurrentProcessId());
+    if (HWND window = FindWindowW(L"FrostBridgeConnectionUI", title.c_str())) {
+        ShowWindow(window, SW_RESTORE);
+        SetForegroundWindow(window);
+        return;
     }
     if (!g_dialogOpen.exchange(true, std::memory_order_acq_rel)) {
         HANDLE thread = CreateThread(nullptr, 0, showConnectionDialog,
@@ -1504,10 +1538,25 @@ void openConnectionForm(int index) {
 // Test seam: routing tests replace process/window launching with a recorder.
 void (*g_openConnectionForm)(int) = openConnectionForm;
 
+void cancelPendingMapSelection() {
+    if(!g_launchControl || g_launchStage<1 || g_launchStage>3) return;
+    const LONG state=InterlockedCompareExchange(&g_launchControl->state,0,0);
+    if(state!=frostlaunch::prepareRequested && state!=frostlaunch::prepared) return;
+    InterlockedExchange(&g_launchControl->state,frostlaunch::failed);
+    g_launchStage=0;
+    g_nextMapIndex=0;
+    g_selectedMapIndex=-1;
+    g_mapSelectionIssued=false;
+    g_endlessSelection=nullptr;
+    g_endlessConfig=nullptr;
+    logLine(L"Multiplayer map selection cancelled; another mode can be selected.");
+}
+
 void __fastcall menuPanelCallbackHook(void* owner, void* event) {
     std::uint32_t panelId = 0;
     if (event && safeRead(static_cast<std::uint8_t*>(event) + 0x18, panelId) &&
         panelId == kMultiplayerSourcePanelId) {
+        cancelPendingMapSelection();
         g_multiplayerMode.store(true, std::memory_order_release);
         g_selectedConnection.store(-1, std::memory_order_release);
         g_connectionPanel.store(nullptr, std::memory_order_release);

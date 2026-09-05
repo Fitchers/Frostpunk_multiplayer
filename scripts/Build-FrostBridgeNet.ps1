@@ -49,7 +49,10 @@ if (-not [string]::IsNullOrWhiteSpace($SteamApiPath)) {
     if (-not (Test-Path -LiteralPath $resolvedSteamApi -PathType Leaf)) {
         throw "steam_api64.dll was not found at $resolvedSteamApi"
     }
-    Copy-Item -LiteralPath $resolvedSteamApi -Destination (Join-Path $outputDirectory 'steam_api64.dll') -Force
+    $steamApiDestination = [System.IO.Path]::GetFullPath((Join-Path $outputDirectory 'steam_api64.dll'))
+    if (-not [string]::Equals($resolvedSteamApi, $steamApiDestination, [System.StringComparison]::OrdinalIgnoreCase)) {
+        Copy-Item -LiteralPath $resolvedSteamApi -Destination $steamApiDestination -Force
+    }
 }
 
 Write-Host "Built: $(Join-Path $outputDirectory 'FrostBridgeNet.exe')"

@@ -22,12 +22,21 @@ int main() {
     check(slotName(L"Зима")==L"Зима_multiplayer","unicode");
     check(!slotName(L"../x") && !slotName(L"C:\\x") && !slotName(L"x:y") && !slotName(L"") && !slotName(std::wstring(96,L'a')),"unsafe name");
     auto root=std::filesystem::current_path()/L"artifacts"/L"save-tests"/std::to_wstring(GetTickCount64());
-    std::filesystem::create_directories(root);
+    check(!std::filesystem::exists(root),"test must start without a native save directory");
     DWORD first=GetCurrentProcessId()+2000000000U,second=first+1;
     Sync host(first,"Host",true,root),guest(second,"Guest",false,root);
     Mailbox h(first),g(second);
     std::queue<Packet> toHost,toGuest;
-    host.send=[&](const Packet& p){toGuest.push(p);};guest.send=[&](const Packet& p){toHost.push(p);};
+    bool dropPrepare=true,dropReady=true,dropFinal=true;
+    host.send=[&](const Packet& p){
+        if(p.phase==1 && dropPrepare) { dropPrepare=false; return; }
+        toGuest.push(p);
+    };
+    guest.send=[&](const Packet& p){
+        if(p.phase==2 && dropReady) { dropReady=false; return; }
+        if(p.phase==7 && dropFinal) { dropFinal=false; return; }
+        toHost.push(p);
+    };
     host.log=guest.log=[](const std::string& s){std::cout<<s<<'\n';};
     bool kicked=false;host.kick=guest.kick=[&]{kicked=true;};
     State hs{true,true,1},gs{true,true,1};
@@ -35,7 +44,7 @@ int main() {
     host.trading=guest.trading=[]{return false;};
     host.connected(true);guest.connected(true);
     auto pump=[&] {
-        auto end=GetTickCount64()+8000;
+        auto end=GetTickCount64()+12000;
         do {
             while(!toGuest.empty()) { auto p=toGuest.front();toGuest.pop();guest.receive(p); }
             while(!toHost.empty()) { auto p=toHost.front();toHost.pop();host.receive(p); }

@@ -41,6 +41,7 @@ public:
     }
     ~Sync() { if(control_) { InterlockedExchange(&control_->role,0); UnmapViewOfFile(control_); } if(mapping_) CloseHandle(mapping_); }
     bool active() const { return active_; }
+    void setHost(bool value) { host_=value; }
     void connected(bool value) { if(control_) InterlockedExchange(&control_->role,value?(host_?1:2):0); }
     void request(LONG operation,const std::wstring& requested) {
         if(!host_) { log("[save] Only the host can save/load a multiplayer checkpoint."); return; }
@@ -65,17 +66,29 @@ public:
         if(!normalized || *normalized!=packet.slot) return;
         try {
             if(!host_ && packet.phase==1) {
-                if(active_) return;
-                try { begin(packet); }
-                catch(...) {
-                    Packet failed=packet; failed.phase=6; send(failed);
-                    log("[save] Disconnected: matching save missing, damaged, or this game is not ready.");
-                    kick(); return;
+                if(active_) {
+                    if(packet.checkpoint==packet_.checkpoint && packet.operation==packet_.operation &&
+                        wcscmp(packet.slot,packet_.slot)==0 && ready_) emit(2);
+                    return;
                 }
+                try { begin(packet); }
+                catch(const std::exception& error) {
+                    Packet failed=packet; failed.phase=6; send(failed);
+                    log(std::string("[save] Failed: ")+error.what());
+                    if(packet.operation==load) kick();
+                    return;
+                }
+            } else if(!host_ && !active_ && done_ && packet.phase==5 &&
+                      packet.checkpoint==packet_.checkpoint && packet.operation==packet_.operation &&
+                      wcscmp(packet.slot,packet_.slot)==0) {
+                emit(7); // resend lost final acknowledgement without saving again
             } else if(active_ && packet.checkpoint==packet_.checkpoint &&
                       packet.operation==packet_.operation && wcscmp(packet.slot,packet_.slot)==0) {
                 if(packet.phase==6) { fail("Peer could not complete the checkpoint operation.",false); return; }
-                if(host_ && packet.phase==2 && !dispatched_) peerReady_=true;
+                if(host_ && packet.phase==2 && !dispatched_ && !peerReady_) {
+                    peerReady_=true;
+                    log("[save] Клиент подтвердил готовность к сохранению/загрузке.");
+                }
                 else if(!host_ && packet.phase==3 && ready_ && !dispatched_) goRequested_=true;
                 else if(host_ && packet.phase==4 && dispatched_) peerDone_=true;
                 else if(!host_ && packet.phase==5 && done_) {
@@ -99,10 +112,28 @@ public:
         }
         if(!active_) return;
         try {
-            if(Clock::now()>deadline_) throw std::runtime_error("Checkpoint timed out; it is not confirmed complete");
+            if(Clock::now()>deadline_) throw std::runtime_error(
+                !ready_?"Timeout: local city has not paused or a resource transfer is pending":
+                host_ && !peerReady_?"Timeout: client did not confirm readiness; check the client's save log":
+                !dispatched_?"Timeout: waiting for the native save slot lock or host command":
+                control_->ackSequence!=command_?"Timeout: game did not process the native save command":
+                !done_?"Timeout: native save file did not appear or loading did not finish":
+                "Timeout: peer did not finish its save/load");
+            if(Clock::now()>=retryAt_) {
+                retryAt_=Clock::now()+std::chrono::seconds(1);
+                if(host_) {
+                    if(!peerReady_) emit(1);
+                    else if(commitSent_) emit(5);
+                    else if(dispatched_ && !peerDone_) emit(3);
+                } else {
+                    if(done_) emit(4);
+                    else if(ready_ && !dispatched_) emit(2);
+                }
+            }
             const auto current=state();
             if(!ready_ && !trading() && (!current.loaded || current.paused)) {
                 ready_=true;
+                log("[save] Город готов. Ожидаем подтверждения второго игрока.");
                 if(!host_) emit(2);
             }
             if(host_ && ready_ && peerReady_ && !dispatched_ && dispatch()) emit(3);
@@ -128,17 +159,21 @@ public:
 private:
     void begin(const Packet& packet) {
         if(!control_ || !control_->modReady) throw std::runtime_error("Restart Frostpunk with the save-enabled DLL");
-        if(!std::filesystem::is_directory(store_.root())) throw std::runtime_error("Native save directory is unavailable");
         if(packet.operation==save) {
             if(!state().loaded) throw std::runtime_error("Load your city before saving");
+            // Fresh profiles have no saves directory before the first save.
+            std::filesystem::create_directories(store_.root());
             if(store_.exists(packet.slot)) throw std::runtime_error("Name already used: choose a new save name (no silent overwrite)");
         } else {
+            if(!std::filesystem::is_directory(store_.root())) throw std::runtime_error("Native save directory is unavailable");
             const auto record=store_.read(packet.slot);
             if(record.checkpoint!=packet.checkpoint) throw std::runtime_error("Save belongs to a different checkpoint");
         }
         store_.select(packet.slot);
         packet_=packet; active_=true;ready_=peerReady_=dispatched_=done_=peerDone_=commitSent_=goRequested_=false;
+        log("[save] Запрос получен; ожидаем паузы города.");
         deadline_=Clock::now()+std::chrono::seconds(120);
+        retryAt_=Clock::now()+std::chrono::seconds(1);
     }
     void emit(LONG phase) { Packet p=packet_;p.phase=phase;send(p); }
     bool dispatch() {
@@ -150,6 +185,7 @@ private:
         wcsncpy_s(control_->commandName,store_.scratch(packet_.checkpoint).c_str(),_TRUNCATE);
         MemoryBarrier(); command_=InterlockedIncrement(&control_->commandSequence);
         dispatched_=true;stableSince_=Clock::now();lastSize_=0;
+        log("[save] Команда передана игре. Ожидаем файл сохранения или загрузку города.");
         return true;
     }
     void fail(const std::string& reason,bool notify=true) {
@@ -164,7 +200,7 @@ private:
     bool host_=false,active_=false,ready_=false,peerReady_=false,dispatched_=false,done_=false,peerDone_=false,commitSent_=false,goRequested_=false;
     Packet packet_{};
     LONG event_=0,command_=0,generation_=0;
-    Clock::time_point deadline_{},stableSince_{};
+    Clock::time_point deadline_{},stableSince_{},retryAt_{};
     std::uintmax_t lastSize_=0;
     std::filesystem::file_time_type lastModified_{};
 };

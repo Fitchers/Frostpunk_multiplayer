@@ -35,7 +35,7 @@
 namespace {
 
 constexpr std::uint32_t kProtocolMagic = 0x31504246;  // "FBP1"
-constexpr std::uint16_t kProtocolVersion = 14;
+constexpr std::uint16_t kProtocolVersion = 15;
 constexpr int kChannel = 17;
 constexpr int kSendUnreliable = 0;
 constexpr int kSendReliable = 2;
@@ -77,6 +77,7 @@ struct PacketHeader {
 struct HelloPayload {
     char playerName[64]{};
     char cityName[64]{};
+    std::uint64_t sessionStartedAtMs = 0;
 };
 
 struct HeartbeatPayload {
@@ -1024,11 +1025,11 @@ public:
           playerName_(std::move(playerName)), cityName_(std::move(cityName)),
           watchFrostpunk_(watchFrostpunk),
           frostpunkProcessId_(frostpunkProcessId), host_(host),
+          sessionStartedAtMs_(timestampMs()),
           started_(std::chrono::steady_clock::now()), output_(std::move(output)) {
         overlay_.open(frostpunkProcessId_, playerName_);
         gameSession_.open(frostpunkProcessId_);
-        // Steam P2P has two symmetric endpoints. Elect one stable coordinator.
-        if(dynamic_cast<SteamTransport*>(&transport_)) host_=local_<expectedPeer_;
+        roleDetermined_=dynamic_cast<SteamTransport*>(&transport_)==nullptr;
         wchar_t appData[32768]{};
         const DWORD appDataLength=GetEnvironmentVariableW(L"APPDATA",appData,static_cast<DWORD>(std::size(appData)));
         if(appDataLength && appDataLength<std::size(appData)) {
@@ -1157,6 +1158,21 @@ private:
         }
         UnmapViewOfFile(control);
         return state;
+    }
+
+    void resetLocalLaunch() {
+        if (!frostpunkProcessId_ || startCommitted_) return;
+        WinHandle mapping(OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE,
+            frostlaunch::name(frostpunkProcessId_).c_str()));
+        if (!mapping) return;
+        auto* control = static_cast<frostlaunch::Control*>(MapViewOfFile(
+            mapping.value, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(frostlaunch::Control)));
+        if (control && control->signature == frostlaunch::magic &&
+            control->layoutVersion == frostlaunch::version) {
+            InterlockedExchange(&control->mapIndex, -1);
+            InterlockedExchange(&control->state, frostlaunch::ready);
+        }
+        if(control) UnmapViewOfFile(control);
     }
 
     void resourceLine(const std::string& name, const CitySnapshotPayload& city) {
@@ -1496,6 +1512,16 @@ private:
         }
     }
 
+    void abortMapSelection(const char* reason, bool notifyPeer) {
+        if(notifyPeer && connected_ && startRequest_)
+            sendStart(MessageType::startResult,startRequest_,frostlaunch::failed,selectedMapIndex_);
+        waitingStart_=prepared_=hostMapPreparing_=waitingClientMap_=false;
+        clientMapPreparing_=clientMapPrepared_=false;
+        selectedMapIndex_=-1;
+        resetLocalLaunch();
+        print(std::string("[game] rejected: ")+reason);
+    }
+
     void receiveStart(MessageType type, const StartPayload& start) {
         if (!connected_ || !start.request) return;
         if (type == MessageType::startPrepare && !host_) {
@@ -1548,7 +1574,7 @@ private:
             print("[game] peer-loading: второй игрок запустил ту же карту.");
         } else if (type == MessageType::startResult && start.request == startRequest_ &&
                    start.status == frostlaunch::failed) {
-            print("[game] peer-failed: второму игроку не удалось подготовить или запустить карту.");
+            abortMapSelection("второй игрок отменил выбор карты или не смог её подготовить.",false);
         }
     }
 
@@ -1564,8 +1590,7 @@ private:
                 launchDeadline_ = now + std::chrono::seconds(30);
                 print("[game] host-map: индекс карты передан клиенту; ожидается подтверждение.");
             } else if (launch.state == frostlaunch::failed || now > launchDeadline_) {
-                hostMapPreparing_ = false;
-                print("[game] failed: хост не смог подготовить доступную карту.");
+                abortMapSelection("выбор карты отменён; можно выбрать другой режим.",true);
             }
         }
         if (clientMapPreparing_) {
@@ -1576,14 +1601,11 @@ private:
                           launch.mapIndex);
                 print("[game] client-map: карта хоста подготовлена; ожидается общий старт.");
             } else if (launch.state == frostlaunch::failed || now > launchDeadline_) {
-                clientMapPreparing_ = false;
-                sendStart(MessageType::startResult, startRequest_, frostlaunch::failed,
-                          selectedMapIndex_);
+                abortMapSelection("карта хоста отменена или недоступна.",true);
             }
         }
         if (waitingClientMap_ && now > launchDeadline_) {
-            waitingClientMap_ = false;
-            print("[game] failed: клиент не подтвердил карту за 30 секунд.");
+            abortMapSelection("клиент не подтвердил карту за 30 секунд.",true);
         }
     }
 
@@ -1607,6 +1629,7 @@ private:
                     (std::min)(playerName_.size(), sizeof(payload.playerName) - 1));
         std::memcpy(payload.cityName, cityName_.data(),
                     (std::min)(cityName_.size(), sizeof(payload.cityName) - 1));
+        payload.sessionStartedAtMs=sessionStartedAtMs_;
         sendPacket(makePacket(type, ++sequence_, local_, payload), true);
     }
 
@@ -1707,19 +1730,30 @@ private:
                 hello.playerName[sizeof(hello.playerName) - 1] = '\0';
                 hello.cityName[sizeof(hello.cityName) - 1] = '\0';
                 if (!hello.playerName[0]) continue;
+                if(!roleDetermined_) {
+                    // The earlier Connect click owns the Steam session. Epoch
+                    // milliseconds make the decision identical on both peers;
+                    // SteamID is only a sub-millisecond tie breaker.
+                    host_=sessionStartedAtMs_<hello.sessionStartedAtMs ||
+                        (sessionStartedAtMs_==hello.sessionStartedAtMs && local_<sender);
+                    roleDetermined_=true;
+                    if(saves_) saves_->setHost(host_);
+                }
+                const bool firstConnection=!connected_;
                 connected_ = true;
                 expectedPeer_ = sender;
                 peerName_ = hello.playerName;
                 for (auto& ch : peerName_) if (static_cast<unsigned char>(ch) < 32) ch = ' ';
-                print(std::string("[peer] player: ") + hello.playerName +
-                      ", city: " + hello.cityName +
-                      (header.type == MessageType::hello ? " (hello)" : " (connected)"));
                 if (header.type == MessageType::hello) sendHello(MessageType::helloAck);
-                overlay_.connected(playerName_, peerName_);
-                if(saves_) saves_->connected(true);
-                print(host_?"[role] host":"[role] client");
-                sendPause(gameSession_.localPause());
-                if (host_ && speedRevision_) sendSpeed(MessageType::speedState, sharedSpeed_, speedRevision_);
+                if(firstConnection) {
+                    print(std::string("[peer] player: ") + hello.playerName +
+                          ", city: " + hello.cityName + " (connected)");
+                    overlay_.connected(playerName_, peerName_);
+                    if(saves_) saves_->connected(true);
+                    print(host_?"[role] host":"[role] client");
+                    sendPause(gameSession_.localPause());
+                    if (host_ && speedRevision_) sendSpeed(MessageType::speedState, sharedSpeed_, speedRevision_);
+                }
             } else if (connected_ &&
                        ((header.type >= MessageType::startPrepare &&
                          header.type <= MessageType::startResult) ||
@@ -1855,7 +1889,7 @@ private:
     bool watchFrostpunk_ = false;
     DWORD frostpunkProcessId_ = 0;
     std::unique_ptr<frostsave::Sync> saves_;
-    bool host_ = false, waitingStart_ = false, prepared_ = false;
+    bool host_ = false, roleDetermined_ = false, waitingStart_ = false, prepared_ = false;
     bool hostMapPreparing_ = false, waitingClientMap_ = false;
     bool clientMapPreparing_ = false, clientMapPrepared_ = false;
     bool startCommitted_ = false, launchReported_ = false;
@@ -1884,6 +1918,7 @@ private:
     bool sessionBarrierReleased_ = false;
     bool skewReported_ = false;
     bool frostpunkMissingReported_ = false;
+    std::uint64_t sessionStartedAtMs_ = 0;
     std::chrono::steady_clock::time_point started_;
     std::chrono::steady_clock::time_point lastReceived_{};
     std::atomic<bool> running_{true};

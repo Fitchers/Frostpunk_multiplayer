@@ -3,6 +3,8 @@
 #include <windows.h>
 #include <bcrypt.h>
 #include <shellapi.h>
+#include <commdlg.h>
+#pragma comment(lib, "comdlg32.lib")
 #include <tlhelp32.h>
 
 #include <array>
@@ -74,6 +76,10 @@ std::filesystem::path launcherDirectory() {
 }
 
 std::filesystem::path configuredGamePath() {
+    const auto config = launcherDirectory() / L"multiplayer.ini";
+    wchar_t savedPath[32768]{};
+    GetPrivateProfileStringW(L"Game", L"Path", L"", savedPath, 32768, config.c_str());
+    if (std::filesystem::is_regular_file(savedPath)) return savedPath;
     std::wstring configured(32768, L'\0');
     const DWORD length = GetEnvironmentVariableW(
         L"FROSTPUNK_EXE", configured.data(), static_cast<DWORD>(configured.size()));
@@ -92,7 +98,16 @@ std::filesystem::path configuredGamePath() {
     for (const auto& candidate : candidates) {
         if (std::filesystem::is_regular_file(candidate)) return candidate;
     }
-    fail("Frostpunk.exe was not found. Set FROSTPUNK_EXE to its full path.");
+    OPENFILENAMEW dialog{};
+    dialog.lStructSize = sizeof(dialog);
+    dialog.lpstrFilter = L"Frostpunk.exe\0Frostpunk.exe\0\0";
+    dialog.lpstrFile = savedPath;
+    dialog.nMaxFile = 32768;
+    dialog.lpstrTitle = L"Выберите установленный Frostpunk.exe";
+    dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    if (!GetOpenFileNameW(&dialog)) fail("Game selection cancelled.");
+    WritePrivateProfileStringW(L"Game", L"Path", savedPath, config.c_str());
+    return savedPath;
 }
 
 std::string sha256(const std::filesystem::path& path) {
