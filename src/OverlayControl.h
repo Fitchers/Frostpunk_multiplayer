@@ -8,7 +8,7 @@
 namespace frostoverlay {
 
 constexpr DWORD magic = 0x324F4246; // "FBO2"
-constexpr DWORD version = 2;
+constexpr DWORD version = 3;
 constexpr LONG maxTransferAmount = 1000000;
 inline bool validAmount(LONG amount) { return amount > 0 && amount <= maxTransferAmount; }
 constexpr std::size_t resourceCount = 6;
@@ -55,15 +55,21 @@ struct Control {
     volatile LONG localDiscontent = -1;
     volatile LONG peerHope = -1;
     volatile LONG peerDiscontent = -1;
+    // 0 unknown, 1 loading, 2 playing, 3 paused. Skew: local minus peer.
+    volatile LONG localState = 0;
+    volatile LONG peerState = 0;
+    volatile LONG skewSeconds = 0;
+    volatile LONG historySequence = 0;
+    wchar_t history[3][160]{}; // newest first; guarded by odd/even sequence
 };
 static_assert(offsetof(Control, local) == 148);
 static_assert(offsetof(Control, outgoingResource) == 204);
 static_assert(offsetof(Control, applyResource) == 220);
 static_assert(offsetof(Control, applyResultSequence) == 236);
-static_assert(sizeof(Control) == 580);
+static_assert(sizeof(Control) == 1556);
 
 inline std::wstring name(DWORD pid) {
-    return L"Local\\FrostBridgeOverlayV3-" + std::to_wstring(pid);
+    return L"Local\\FrostBridgeOverlayV4-" + std::to_wstring(pid);
 }
 
 inline bool validResource(LONG value) {

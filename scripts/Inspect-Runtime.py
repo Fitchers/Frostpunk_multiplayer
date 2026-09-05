@@ -9,7 +9,7 @@ import pefile
 p = argparse.ArgumentParser()
 p.add_argument('pid', type=int)
 p.add_argument('base', type=lambda s: int(s, 0))
-p.add_argument('mode', choices=['strings', 'disasm', 'refs', 'read', 'globals'])
+p.add_argument('mode', choices=['strings', 'disasm', 'refs', 'calls', 'read', 'globals'])
 p.add_argument('target')
 p.add_argument('--size', type=lambda s: int(s, 0), default=0x200)
 a = p.parse_args()
@@ -58,6 +58,15 @@ try:
                 for m in re.finditer(rb'[ -~]{5,}',b):
                     if re.search(a.target,m[0].decode(),re.I):
                         print(hex(s.VirtualAddress+m.start()),m[0].decode()[:200])
+    elif a.mode == 'calls':
+        target = a.base + int(a.target, 0)
+        for s in pe.sections:
+            if not s.Characteristics & 0x20000000: continue
+            b = read(a.base+s.VirtualAddress,s.Misc_VirtualSize)
+            for m in re.finditer(b'\xe8', b):
+                off = m.start()
+                if off + 5 <= len(b) and a.base+s.VirtualAddress+off+5+struct.unpack_from('<i',b,off+1)[0] == target:
+                    print('possible direct call',hex(s.VirtualAddress+off))
     else:
         target = a.base+int(a.target,0)
         # RIP-relative displacements, then decode a bounded window to inspect hits.

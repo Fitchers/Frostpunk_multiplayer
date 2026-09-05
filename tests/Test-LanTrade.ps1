@@ -12,9 +12,9 @@ function Start-Bridge([string[]]$Arguments) {
 }
 try {
  foreach($gameId in $fakePids) {
-  $map=[IO.MemoryMappedFiles.MemoryMappedFile]::CreateNew("Local\FrostBridgeOverlayV3-$gameId",580)
+  $map=[IO.MemoryMappedFiles.MemoryMappedFile]::CreateNew("Local\FrostBridgeOverlayV4-$gameId",1556)
   $view=$map.CreateViewAccessor()
-  $view.Write(0,[uint32]0x324F4246); $view.Write(4,[uint32]2); $view.Write(8,[int]1)
+  $view.Write(0,[uint32]0x324F4246); $view.Write(4,[uint32]3); $view.Write(8,[int]1)
   $maps+=,$map; $views+=,$view
  }
  $listener=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,0)
@@ -74,12 +74,13 @@ try {
  if($balances[0][0] -ne 50 -or $balances[1][0] -ne 110) {
   throw "Trade balances are wrong: host=$($balances[0][0]) guest=$($balances[1][0])"
  }
+ if($views[0].ReadInt32(592)-le0 -or $views[1].ReadInt32(592)-le0) { throw 'Transfer history missing' }
  foreach($child in $children) { $child.StandardInput.WriteLine('quit'); $child.StandardInput.Flush() }
  foreach($child in $children) { if(!$child.WaitForExit(5000)) { throw 'Bridge did not exit' } }
  $hostLog=$outputs[0].Result; $guestLog=$outputs[1].Result
- if(!$hostLog.Contains('[trade] Отправлено 50 угля игроку Борис.')) { throw 'Sender confirmation missing' }
+ if(!$hostLog.Contains('[trade] Вы отправили Борис 50 угля.')) { throw 'Sender confirmation missing' }
  if(!$guestLog.Contains('[trade] Получено 50 угля от игрока Анна.')) { throw 'Recipient confirmation missing' }
- if(!$hostLog.Contains('[trade] Отправлено 50 сырой еды игроку Борис.')) { throw 'Repeated/resource-specific sender confirmation missing' }
+ if(!$hostLog.Contains('[trade] Вы отправили Борис 50 сырой еды.')) { throw 'Repeated/resource-specific sender confirmation missing' }
  if(!$guestLog.Contains('[trade] Получено 50 сырой еды от игрока Анна.')) { throw 'Repeated/resource-specific recipient confirmation missing' }
  if($balances[0][4] -ne 30 -or $balances[1][4] -ne 65) { throw 'Partial debit was not refunded safely' }
  if($views[0].ReadInt32(216) -ne 0) { throw 'Overlay stayed busy after completion' }

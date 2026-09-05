@@ -13,7 +13,8 @@
 
 namespace {
 constexpr int kName=101, kAddress=102, kPort=103, kHost=104, kJoin=105,
-              kStop=106, kLog=107, kStatus=108, kChat=109, kSend=110, kStart=111;
+              kStop=106, kLog=107, kStatus=108, kChat=109, kSend=110, kStart=111,
+              kSaveName=112,kSave=113,kLoad=114;
 constexpr wchar_t kClass[] = L"FrostBridgeConnectionUI";
 HWND g_window{};
 HFONT g_font{};
@@ -65,6 +66,7 @@ void controls(bool active) {
     EnableWindow(GetDlgItem(g_window,kChat),active);
     EnableWindow(GetDlgItem(g_window,kSend),active);
     EnableWindow(GetDlgItem(g_window,kStart),active && g_host && g_connected && !g_startPending);
+    for(int id:{kSaveName,kSave,kLoad}) EnableWindow(GetDlgItem(g_window,id),active && g_host && g_connected);
 }
 void stopSession() {
     // Cancel our network thread and release sockets. No process termination.
@@ -75,6 +77,7 @@ void pumpOutput() {
     if(!g_session) return;
     for(const auto& line : g_session->takeOutput()) {
             log(fromUtf8(line));
+            if(line=="[role] host" || line=="[role] client") { g_host=line=="[role] host"; controls(true); }
             if(line.rfind("[peer] player:",0)==0) {
                 g_connected=true; controls(true);
                 status(g_host?L"Игрок подключён. Нажмите «Начать игру».":L"Подключено. Ждём, когда хост начнёт игру.");
@@ -141,7 +144,11 @@ LRESULT CALLBACK windowProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
         control(L"BUTTON",L"Отключиться",kStop,454,177,206,34,WS_TABSTOP);
         control(L"STATIC",L"Введите имя и выберите действие",kStatus,20,220,440,52);
         control(L"BUTTON",L"Начать игру",kStart,474,225,186,38,WS_TABSTOP);
-        control(L"EDIT",L"",kLog,20,280,640,245,WS_VSCROLL|ES_MULTILINE|ES_READONLY|ES_AUTOVSCROLL);
+        control(L"EDIT",L"survival",kSaveName,20,280,280,30,WS_TABSTOP|ES_AUTOHSCROLL);
+        control(L"BUTTON",L"Сохранить всем",kSave,313,280,167,30,WS_TABSTOP);
+        control(L"BUTTON",L"Загрузить всем",kLoad,493,280,167,30,WS_TABSTOP);
+        control(L"STATIC",L"Имя + _multiplayer. Для продолжения используйте то же имя игрока.",0,20,314,650,24);
+        control(L"EDIT",L"",kLog,20,342,640,183,WS_VSCROLL|ES_MULTILINE|ES_READONLY|ES_AUTOVSCROLL);
         control(L"EDIT",L"",kChat,20,539,480,30,WS_TABSTOP|ES_AUTOHSCROLL);
         control(L"BUTTON",L"Отправить",kSend,515,539,145,30,WS_TABSTOP);
         control(L"STATIC",L"Окно можно свернуть и продолжить игру. Закрытие отключает сессию.",0,20,582,655,25);
@@ -149,6 +156,7 @@ LRESULT CALLBACK windowProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
         SendDlgItemMessageW(window,kAddress,EM_SETLIMITTEXT,253,0);
         SendDlgItemMessageW(window,kPort,EM_SETLIMITTEXT,5,0);
         SendDlgItemMessageW(window,kChat,EM_SETLIMITTEXT,500,0);
+        SendDlgItemMessageW(window,kSaveName,EM_SETLIMITTEXT,84,0);
         controls(false); SetTimer(window,1,100,nullptr);
         if(g_autoAction) PostMessageW(window,WM_COMMAND,
             MAKEWPARAM(g_autoAction==1?kHost:kJoin,BN_CLICKED),0);
@@ -159,6 +167,11 @@ LRESULT CALLBACK windowProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
             switch(LOWORD(wp)) {
             case kHost: startSession(true); break;
             case kJoin: startSession(false); break;
+            case kSave:
+            case kLoad:
+                if(g_session && g_host && g_connected)
+                    g_session->send(std::string(LOWORD(wp)==kSave?"save ":"load ")+toUtf8(field(kSaveName)));
+                break;
             case kStop: stopSession(); status(L"Отключено"); log(L"Сессия остановлена."); break;
             case kStart: {
                 if (!g_session || !g_host || !g_connected || g_startPending) break;

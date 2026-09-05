@@ -16,6 +16,7 @@
 #include "../LaunchControl.h"
 #include "../OverlayControl.h"
 #include "../SessionControl.h"
+#include "../SaveControl.h"
 #include "../FrostBridgeNet/ResourceReader.h"
 
 namespace {
@@ -165,6 +166,8 @@ LONG g_pendingSpeedCommand = 0;
 int g_pendingSpeedMode = -1;
 ULONGLONG g_pendingSpeedRetry = 0;
 bool g_sessionLoaded = false;
+bool g_waitReloadPause = false;
+LONG g_reloadPauseSequence = 0;
 bool g_sessionPaused = true;
 bool g_pendingInitialPause = false;
 std::uint64_t g_overlayPaintRevision = 0;
@@ -829,6 +832,9 @@ void advanceSessionControl() {
                 g_pendingSpeedCommand = 0;
                 g_pendingSpeedMode = -1;
                 g_pendingInitialPause = false;
+                // A loaded world may replace the timer. An old acknowledgement
+                // must never suppress applying the same command to the new one.
+                g_lastPauseCommand = 0;
             }
             InterlockedIncrement(&g_sessionControl->loadGeneration);
         }
@@ -840,15 +846,21 @@ void advanceSessionControl() {
     const LONG sequence = InterlockedCompareExchange(
         &g_sessionControl->pauseCommandSequence, 0, 0);
     advanceSpeedControl(connected);
-    if (justLoaded && connected) g_pendingInitialPause = true;
+    if (justLoaded && connected) {
+        g_pendingInitialPause = true;
+        g_waitReloadPause = true;
+        g_reloadPauseSequence = sequence;
+    }
     if (!connected) {
         applyNativePause(false); // Release only our reason when the bridge disconnects.
         g_pendingInitialPause = false;
+        g_waitReloadPause = false;
     }
     if (g_pendingInitialPause && applyNativePause(true)) {
         g_pendingInitialPause = false;
     }
-    if (connected && sequence && sequence != g_lastPauseCommand) {
+    if (g_waitReloadPause && sequence != g_reloadPauseSequence) g_waitReloadPause = false;
+    if (connected && sequence && !g_waitReloadPause) {
         MemoryBarrier();
         if (applyNativePause(g_sessionControl->pauseCommandValue != 0)) {
             g_lastPauseCommand = sequence;
@@ -944,6 +956,8 @@ std::uint64_t overlayPaintRevision() {
     mix(InterlockedCompareExchange(&g_overlayControl->localDiscontent, 0, 0));
     mix(InterlockedCompareExchange(&g_overlayControl->peerHope, 0, 0));
     mix(InterlockedCompareExchange(&g_overlayControl->peerDiscontent, 0, 0));
+    mix(g_overlayControl->localState); mix(g_overlayControl->peerState);
+    mix(g_overlayControl->skewSeconds); mix(g_overlayControl->historySequence);
     return value;
 }
 
@@ -953,7 +967,7 @@ void placeOverlayWindow(HWND window, int x, int y, int width, int height) {
     if (!GetWindowRect(window, &current) || current.left != x || current.top != y ||
         current.right - current.left != width || current.bottom - current.top != height) {
         SetWindowPos(window, HWND_TOPMOST, x, y, width, height,
-                     SWP_NOACTIVATE | (visible ? 0 : SWP_SHOWWINDOW));
+                     SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS | (visible ? 0 : SWP_SHOWWINDOW));
     } else if (!visible) {
         ShowWindow(window, SW_SHOWNOACTIVATE);
     }
@@ -969,78 +983,124 @@ void refreshAmountControls(const frostoverlay::Values& local) {
     }
 }
 
-void drawVitalBars(HDC dc, int top, LONG hope, LONG discontent) {
-    const LONG values[]{discontent, hope};
-    const wchar_t* labels[]{L"Недовольство", L"Надежда"};
-    for (int i = 0; i < 2; ++i) {
-        const int x = 18 + i * 400;
-        RECT bar{x, top, x + 380, top + 23};
-        HBRUSH bg = CreateSolidBrush(RGB(41, 48, 53));
-        FillRect(dc, &bar, bg); DeleteObject(bg);
-        if (values[i] >= 0 && values[i] <= 10000) {
-            RECT fill = bar;
-            fill.right = fill.left + 380 * values[i] / 10000;
-            HBRUSH brush = CreateSolidBrush(i ? RGB(40, 142, 189) : RGB(172, 45, 49));
-            FillRect(dc, &fill, brush); DeleteObject(brush);
+
+constexpr int overlayWidth = 760, overlayHeight = 604;
+int g_selectedResource = 0;
+RECT g_quickButtons[4]{};
+constexpr const wchar_t* resourceLabels[] = {
+    L"Уголь", L"Древесина", L"Сталь", L"Паровые ядра", L"Сырая еда", L"Пайки"};
+
+void selectOverlayResource(HWND window, int resource) {
+    g_selectedResource = resource;
+    for (int i = 0; i < 6; ++i)
+        ShowWindow(g_amountSliders[i], i == resource ? SW_SHOWNOACTIVATE : SW_HIDE);
+    InvalidateRect(window, nullptr, FALSE);
+}
+
+void overlayText(HDC dc, const std::wstring& value, RECT rect, COLORREF color,
+                 UINT align = DT_LEFT) {
+    SetTextColor(dc, color);
+    DrawTextW(dc, value.c_str(), -1, &rect,
+        align | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+}
+
+void overlayFill(HDC dc, RECT rect, COLORREF color) {
+    HBRUSH brush = CreateSolidBrush(color);
+    FillRect(dc, &rect, brush); DeleteObject(brush);
+}
+
+void resourceIcon(HDC dc, int x, int y, int resource) {
+    const int saved = SaveDC(dc);
+    SetViewportOrgEx(dc, x, y, nullptr);
+    HPEN pen = CreatePen(PS_SOLID, 2, RGB(235,192,85));
+    HBRUSH brush = CreateSolidBrush(RGB(113,90,42));
+    SelectObject(dc, pen); SelectObject(dc, brush);
+    if (resource == 0) {
+        POINT points[]{{2,9},{9,2},{19,5},{23,16},{15,23},{4,20}};
+        Polygon(dc, points, 6);
+    } else if (resource == 1) {
+        Rectangle(dc,4,6,21,19); Ellipse(dc,1,6,10,19); Ellipse(dc,4,10,7,15);
+        MoveToEx(dc,11,10,nullptr); LineTo(dc,19,10);
+    } else if (resource == 2) {
+        POINT points[]{{2,17},{6,7},{19,7},{23,17}};
+        Polygon(dc,points,4); MoveToEx(dc,2,20,nullptr); LineTo(dc,23,20);
+    } else if (resource == 3) {
+        RoundRect(dc,5,3,20,23,5,5); Rectangle(dc,9,0,16,4);
+        Ellipse(dc,9,9,16,17);
+    } else if (resource == 4) {
+        Ellipse(dc,2,7,19,19);
+        POINT tail[]{{18,13},{24,6},{24,20}}; Polygon(dc,tail,3);
+        SetPixel(dc,6,12,RGB(255,255,255));
+    } else {
+        Ellipse(dc,2,3,23,24); Ellipse(dc,6,7,19,20);
+        MoveToEx(dc,0,2,nullptr); LineTo(dc,0,23);
+    }
+    RestoreDC(dc,saved); DeleteObject(pen); DeleteObject(brush);
+}
+
+void drawPlayerCard(HDC dc, int x, const std::wstring& name, LONG state,
+                    LONG hope, LONG discontent) {
+    constexpr const wchar_t* states[]{L"нет данных",L"загружается",L"играет",L"пауза"};
+    overlayText(dc,name,{x,40,x+350,64},RGB(246,197,70));
+    overlayText(dc,states[std::clamp(state,0L,3L)],{x,65,x+350,85},RGB(185,198,207));
+    const LONG values[]{hope,discontent};
+    for (int i=0;i<2;++i) {
+        RECT bar{x+i*178,91,x+i*178+166,110};
+        overlayFill(dc,bar,RGB(38,48,55));
+        if(values[i]>=0 && values[i]<=10000) {
+            RECT fill=bar; fill.right=fill.left+166*values[i]/10000;
+            overlayFill(dc,fill,i ? RGB(151,49,58) : RGB(35,115,153));
         }
-        wchar_t label[80]{};
-        if (values[i] < 0) _snwprintf_s(label, _TRUNCATE, L"%s: нет данных", labels[i]);
-        else _snwprintf_s(label, _TRUNCATE, L"%s: %.1f%%", labels[i], values[i] / 100.0);
-        SetTextColor(dc, RGB(245,245,245));
-        DrawTextW(dc, label, -1, &bar, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+        wchar_t text[64]{};
+        if(values[i]<0) _snwprintf_s(text,_TRUNCATE,L"%s: —",i?L"Недов.":L"Надежда");
+        else _snwprintf_s(text,_TRUNCATE,L"%s: %.1f%%",i?L"Недов.":L"Надежда",values[i]/100.0);
+        overlayText(dc,text,bar,RGB(240,245,247),DT_CENTER);
     }
 }
 
-void drawOverlayRow(HDC dc, int top, const std::wstring& player,
-                    const frostoverlay::Values& values, bool buttons,
-                    HFONT normalFont, HFONT smallFont, const frostoverlay::Values& local) {
-    SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, buttons ? RGB(246, 197, 70) : RGB(190, 202, 210));
-    SelectObject(dc, normalFont);
-    RECT playerRect{18, top, 800, top + 25};
-    DrawTextW(dc, player.c_str(), -1, &playerRect, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
-
-    constexpr const wchar_t* labels[] = {
-        L"Уголь", L"Древесина", L"Сталь", L"Паровые ядра", L"Сырая еда", L"Пайки"};
-    SelectObject(dc, smallFont);
-    for (LONG resource = 0; resource < static_cast<LONG>(frostoverlay::resourceCount); ++resource) {
-        const int column = resource % 3;
-        const int row = resource / 3;
-        const int left = 18 + column * 266;
-        const int y = top + 29 + row * (buttons ? 78 : 32);
-        wchar_t text[96]{};
-        _snwprintf_s(text, _TRUNCATE, L"%s: %ld", labels[resource], values.item[resource]);
-        SetTextColor(dc, RGB(235, 238, 240));
-        RECT valueRect{left, y, left + 210, y + 26};
-        DrawTextW(dc, text, -1, &valueRect, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-        if (buttons) {
-            RECT button{left + 213, y + 29, left + 243, y + 54};
-            g_plusButtons[resource] = button;
-            const bool enabled = canSend(resource, local);
-            HBRUSH fill = CreateSolidBrush(enabled ? RGB(133, 97, 25) : RGB(56, 60, 64));
-            FillRect(dc, &button, fill);
-            DeleteObject(fill);
-            FrameRect(dc, &button, static_cast<HBRUSH>(GetStockObject(GRAY_BRUSH)));
-            SetTextColor(dc, enabled ? RGB(255, 224, 128) : RGB(120, 124, 128));
-            DrawTextW(dc, L"+", -1, &button, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
-        }
+void drawResourceTable(HDC dc, const frostoverlay::Values& local,
+                        const frostoverlay::Values& peer) {
+    constexpr COLORREF white=RGB(227,235,240), muted=RGB(153,170,180), gold=RGB(246,197,70);
+    overlayText(dc,L"РЕСУРС",{52,145,240,166},muted);
+    overlayText(dc,L"У тебя → У друга",{244,145,452,166},muted,DT_CENTER);
+    overlayText(dc,L"Количество",{473,145,565,166},muted,DT_CENTER);
+    for(int i=0;i<6;++i) {
+        int y=174+i*42;
+        overlayFill(dc,{16,y-2,744,y+37},i==g_selectedResource?RGB(35,46,52):RGB(20,28,33));
+        resourceIcon(dc,24,y+4,i);
+        overlayText(dc,resourceLabels[i],{58,y,235,y+32},white);
+        overlayText(dc,std::to_wstring(local.item[i]),{235,y,323,y+32},white,DT_RIGHT);
+        overlayText(dc,L"→",{328,y,360,y+32},gold,DT_CENTER);
+        overlayText(dc,std::to_wstring(peer.item[i]),{365,y,450,y+32},white);
+        RECT button{592,y+2,729,y+30};
+        g_plusButtons[i]=button;
+        const bool enabled=canSend(i,local);
+        overlayFill(dc,button,enabled?RGB(112,86,31):RGB(43,49,54));
+        overlayText(dc,L"Передать",button,enabled?gold:RGB(125,137,144),DT_CENTER);
+    }
+    overlayText(dc,std::wstring(resourceLabels[g_selectedResource])+L" · доступно "+
+        std::to_wstring(local.item[g_selectedResource]),{20,432,358,455},muted);
+    const wchar_t* quick[]{L"1",L"10",L"50",L"Всё"};
+    for(int i=0;i<4;++i) {
+        g_quickButtons[i]={446+i*74,435,512+i*74,464};
+        overlayFill(dc,g_quickButtons[i],RGB(47,56,61));
+        overlayText(dc,quick[i],g_quickButtons[i],gold,DT_CENTER);
     }
 }
-
 LRESULT CALLBACK overlayWindowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     switch (message) {
     case WM_CREATE:
         for (int i = 0; i < static_cast<int>(frostoverlay::resourceCount); ++i) {
-            const int left = 18 + (i % 3) * 266, y = 174 + 29 + (i / 3) * 78 + 29;
+            const int left = 481, y = 176 + i * 42;
             g_amountEdits[i] = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"1",
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_NUMBER | ES_AUTOHSCROLL,
-                left, y, 66, 25, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(100 + i)), g_module, nullptr);
+                left, y, 78, 27, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(100 + i)), g_module, nullptr);
             SendMessageW(g_amountEdits[i], EM_SETLIMITTEXT, 7, 0);
             SendMessageW(g_amountEdits[i], WM_SETFONT,
                 reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
             g_amountSliders[i] = CreateWindowExW(0, TRACKBAR_CLASSW, L"",
-                WS_CHILD | WS_VISIBLE | WS_TABSTOP | TBS_NOTICKS,
-                left + 72, y, 133, 25, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(200 + i)), g_module, nullptr);
+                WS_CHILD | WS_TABSTOP | TBS_NOTICKS,
+                20, 460, 396, 25, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(200 + i)), g_module, nullptr);
             SendMessageW(g_amountSliders[i], TBM_SETRANGEMIN, FALSE, 0);
         }
         return 0;
@@ -1052,6 +1112,8 @@ LRESULT CALLBACK overlayWindowProc(HWND window, UINT message, WPARAM wp, LPARAM 
         if (HWND game = findGameWindow()) SetForegroundWindow(game);
         return 0;
     case WM_COMMAND:
+        if (LOWORD(wp) >= 100 && LOWORD(wp) < 106 && HIWORD(wp) == EN_SETFOCUS)
+            selectOverlayResource(window, LOWORD(wp) - 100);
         if (LOWORD(wp) >= 100 && LOWORD(wp) < 106 && HIWORD(wp) == EN_CHANGE &&
             !g_updatingAmounts && g_overlayControl) {
             frostoverlay::Values local{};
@@ -1072,6 +1134,19 @@ LRESULT CALLBACK overlayWindowProc(HWND window, UINT message, WPARAM wp, LPARAM 
         return 0;
     case WM_LBUTTONUP: {
         const POINT point{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        if (point.y >= 174 && point.y < 426 && point.x < 470)
+            selectOverlayResource(window, (point.y - 174) / 42);
+        if (g_overlayControl) {
+            frostoverlay::Values stock{};
+            if (frostoverlay::readSnapshot(g_overlayControl->local, stock)) {
+                for (int i=0;i<4;++i) if (PtInRect(&g_quickButtons[i],point)) {
+                    const LONG quick[]{1,10,50,std::clamp(stock.item[g_selectedResource],0L,frostoverlay::maxTransferAmount)};
+                    SetWindowTextW(g_amountEdits[g_selectedResource],std::to_wstring(quick[i]).c_str());
+                    selectOverlayResource(window,g_selectedResource);
+                    return 0;
+                }
+            }
+        }
         if (!g_overlayControl || InterlockedCompareExchange(
                 &g_overlayControl->connection, 0, 0) !=
                 static_cast<LONG>(frostoverlay::Connection::connected) ||
@@ -1114,7 +1189,7 @@ LRESULT CALLBACK overlayWindowProc(HWND window, UINT message, WPARAM wp, LPARAM 
             GetClientRect(game, &client);
             POINT origin{};
             ClientToScreen(game, &origin);
-            constexpr int width = 820, height = 410;
+            constexpr int width = overlayWidth, height = overlayHeight;
             const int x = origin.x + (client.right - width) / 2;
             const int y = origin.y + (client.bottom - height) / 2;
             placeOverlayWindow(window, x, y, width, height);
@@ -1122,6 +1197,8 @@ LRESULT CALLBACK overlayWindowProc(HWND window, UINT message, WPARAM wp, LPARAM 
         const auto revision = overlayPaintRevision();
         if (revision != g_overlayPaintRevision) {
             g_overlayPaintRevision = revision;
+            frostoverlay::Values stock{};
+            if (g_overlayControl && frostoverlay::readSnapshot(g_overlayControl->local,stock)) refreshAmountControls(stock);
             if (IsWindowVisible(window)) InvalidateRect(window, nullptr, FALSE);
         }
         return 0;
@@ -1153,7 +1230,7 @@ LRESULT CALLBACK overlayWindowProc(HWND window, UINT message, WPARAM wp, LPARAM 
         SetBkMode(dc, TRANSPARENT);
         const HGDIOBJ oldFont = SelectObject(dc, title);
         SetTextColor(dc, RGB(246, 197, 70));
-        RECT heading{12, 5, 808, 30};
+        RECT heading{12, 5, overlayWidth - 12, 30};
         DrawTextW(dc, L"FROSTPUNK MULTIPLAYER  •  ОБМЕН РЕСУРСАМИ", -1,
                   &heading, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
         frostoverlay::Values local{}, peer{};
@@ -1163,13 +1240,32 @@ LRESULT CALLBACK overlayWindowProc(HWND window, UINT message, WPARAM wp, LPARAM 
         }
         std::wstring localName, peerName;
         overlayNames(localName, peerName);
-        refreshAmountControls(local);
-        drawOverlayRow(dc, 39, localName + L" (вы)", local, false, normal, small, local);
-        drawVitalBars(dc, 136, g_overlayControl ? g_overlayControl->localHope : -1,
-            g_overlayControl ? g_overlayControl->localDiscontent : -1);
-        drawOverlayRow(dc, 174, peerName + L" (получатель)", peer, true, normal, small, local);
-        drawVitalBars(dc, 344, g_overlayControl ? g_overlayControl->peerHope : -1,
-            g_overlayControl ? g_overlayControl->peerDiscontent : -1);
+        SelectObject(dc, small);
+        drawPlayerCard(dc,20,localName+L" (вы)",g_overlayControl?g_overlayControl->localState:0,
+            g_overlayControl?g_overlayControl->localHope:-1,g_overlayControl?g_overlayControl->localDiscontent:-1);
+        drawPlayerCard(dc,394,peerName,g_overlayControl?g_overlayControl->peerState:0,
+            g_overlayControl?g_overlayControl->peerHope:-1,g_overlayControl?g_overlayControl->peerDiscontent:-1);
+        const bool clocks = g_overlayControl && g_overlayControl->localState >= 2 && g_overlayControl->peerState >= 2;
+        const LONG skew = g_overlayControl ? g_overlayControl->skewSeconds : 0;
+        std::wstring clockText = !clocks ? L"Разница времени: ждём данные обоих городов" :
+            L"Разница игрового времени: " + std::to_wstring(skew) + L" с (вы − друг)";
+        overlayText(dc,clockText,{20,116,740,139},RGB(176,194,204),DT_CENTER);
+        drawResourceTable(dc,local,peer);
+        overlayText(dc,L"ПОСЛЕДНИЕ ПЕРЕДАЧИ",{20,492,740,512},RGB(246,197,70));
+        wchar_t history[3][160]{};
+        if (g_overlayControl) {
+            const LONG before=InterlockedCompareExchange(&g_overlayControl->historySequence,0,0);
+            if (!(before&1)) {
+                MemoryBarrier(); std::memcpy(history,g_overlayControl->history,sizeof(history)); MemoryBarrier();
+                if(before!=InterlockedCompareExchange(&g_overlayControl->historySequence,0,0))
+                    ZeroMemory(history,sizeof(history));
+            }
+        }
+        for(int i=0;i<3;++i) {
+            history[i][159]=0;
+            overlayText(dc,history[i][0]?history[i]:(i==0?L"Пока нет передач":L""),
+                {20,514+i*20,740,534+i*20},RGB(191,204,213));
+        }
 
         wchar_t notification[160]{};
         if (g_overlayControl) {
@@ -1182,8 +1278,8 @@ LRESULT CALLBACK overlayWindowProc(HWND window, UINT message, WPARAM wp, LPARAM 
         }
         SetTextColor(dc, RGB(184, 195, 202));
         SelectObject(dc, small);
-        RECT status{18, 376, 800, 403};
-        DrawTextW(dc, notification[0] ? notification : L"Выберите количество полем или ползунком, затем нажмите +. Повторный MULTIPLAYER закроет панель.",
+        RECT status{20, 579, 740, 600};
+        DrawTextW(dc, notification[0] ? notification : L"Выберите ресурс для ползунка. MULTIPLAYER закрывает панель.",
                   -1, &status, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_VCENTER);
         SelectObject(dc, oldFont);
         DeleteObject(title); DeleteObject(normal); DeleteObject(small);
@@ -1303,7 +1399,7 @@ DWORD WINAPI overlayThread(void*) {
     g_overlayWindow = CreateWindowExW(
         WS_EX_LAYERED | WS_EX_TOOLWINDOW,
         cls.lpszClassName, L"FrostBridge Overlay", WS_POPUP | WS_CLIPCHILDREN,
-        0, 0, 820, 410, owner, nullptr, g_module, nullptr);
+        0, 0, overlayWidth, overlayHeight, owner, nullptr, g_module, nullptr);
     if (!g_overlayWindow) {
         logLine(L"Could not create in-game resource overlay window.");
         return 1;
@@ -1646,6 +1742,87 @@ void advanceEndlessLaunch() {
     }
 }
 
+frostsave::Control* g_saveControl = nullptr;
+HANDLE g_saveMapping = nullptr;
+InlineHook g_saveHook, g_loadHook;
+using NativeSave = bool(__fastcall*)(void*, const wchar_t*, bool, bool);
+using NativeLoad = void(__fastcall*)(void*, const wchar_t*);
+NativeSave g_originalSave = nullptr;
+NativeLoad g_originalLoad = nullptr;
+
+bool publishSaveEvent(LONG operation, const wchar_t* name) {
+    if (!g_saveControl || g_saveControl->role != 1 || !name ||
+        GetTickCount64()-static_cast<ULONGLONG>(InterlockedCompareExchange64(&g_saveControl->heartbeat,0,0))>2000) return false;
+    // Hook may run inside engine callbacks: bounded copy only, no allocation/I/O.
+    wchar_t copy[frostsave::nameCapacity]{};
+    size_t i=0;
+    for (; i+1<std::size(copy); ++i) {
+        if(!safeRead(name+i,copy[i])) return true;
+        if(!copy[i]) break;
+    }
+    if(i+1==std::size(copy)) copy[0]=0; // bridge reports invalid/too long
+    g_saveControl->eventOperation=operation;
+    std::memcpy(g_saveControl->eventName,copy,sizeof(copy));
+    MemoryBarrier(); InterlockedIncrement(&g_saveControl->eventSequence);
+    return true;
+}
+
+bool __fastcall saveRequestHook(void* owner, const wchar_t* name, bool automatic, bool extra) {
+    if(!automatic && !extra && publishSaveEvent(frostsave::save,name)) return true;
+    return g_originalSave(owner,name,automatic,extra);
+}
+void __fastcall loadRequestHook(void* owner, const wchar_t* name) {
+    if(publishSaveEvent(frostsave::load,name)) return;
+    g_originalLoad(owner,name);
+}
+
+void advanceSaveControl() {
+    if(!g_saveControl || !g_originalSave || !g_originalLoad) return;
+    const LONG sequence=InterlockedCompareExchange(&g_saveControl->commandSequence,0,0);
+    if(sequence==g_saveControl->ackSequence) return;
+    MemoryBarrier();
+    wchar_t name[frostsave::nameCapacity]{};
+    std::memcpy(name,g_saveControl->commandName,sizeof(name)); name[std::size(name)-1]=0;
+    const auto valid=frostsave::slotName(name);
+    LONG result=-1;
+    if(valid && *valid==name && g_saveControl->role) {
+        void* owner=reinterpret_cast<void*>(g_gameBase+0x2B68120);
+        std::uintptr_t vtable=0;
+        if(safeRead(owner,vtable) && vtable==g_gameBase+0x1DF9AE0) {
+            if(g_saveControl->commandOperation==frostsave::save && g_sessionControl && g_sessionControl->gameLoaded)
+                result=g_originalSave(owner,name,false,false)?1:-1;
+            else if(g_saveControl->commandOperation==frostsave::load) {
+                g_originalLoad(owner,name); result=1;
+            }
+        }
+    }
+    InterlockedExchange(&g_saveControl->result,result);
+    MemoryBarrier(); InterlockedExchange(&g_saveControl->ackSequence,sequence);
+}
+
+bool installSaveHooks() {
+    constexpr unsigned char saveBytes[]{0x40,0x57,0x48,0x83,0xec,0x40,0x48,0xc7,0x44,0x24,0x20,0xfe,0xff,0xff,0xff};
+    constexpr unsigned char loadBytes[]{0x40,0x57,0x48,0x83,0xec,0x30,0x48,0xc7,0x44,0x24,0x20,0xfe,0xff,0xff,0xff};
+    if(!g_saveHook.install(reinterpret_cast<void*>(g_gameBase+0x11B5F80),reinterpret_cast<void*>(saveRequestHook),saveBytes,sizeof(saveBytes))) return false;
+    g_originalSave=g_saveHook.original<NativeSave>();
+    if(!g_loadHook.install(reinterpret_cast<void*>(g_gameBase+0x11B5E30),reinterpret_cast<void*>(loadRequestHook),loadBytes,sizeof(loadBytes))) return false;
+    g_originalLoad=g_loadHook.original<NativeLoad>();
+    HANDLE mapping=CreateFileMappingW(INVALID_HANDLE_VALUE,nullptr,PAGE_READWRITE,0,sizeof(frostsave::Control),frostsave::name(GetCurrentProcessId()).c_str());
+    g_saveMapping=mapping;
+    if(!mapping) return false;
+    const bool created=GetLastError()!=ERROR_ALREADY_EXISTS;
+    g_saveControl=static_cast<frostsave::Control*>(MapViewOfFile(mapping,FILE_MAP_ALL_ACCESS,0,0,sizeof(frostsave::Control)));
+    if(!g_saveControl) return false;
+    if(created) {
+        ZeroMemory(g_saveControl,sizeof(*g_saveControl));
+        g_saveControl->layoutVersion=frostsave::version;
+        MemoryBarrier(); g_saveControl->signature=frostsave::magic;
+    }
+    if(g_saveControl->signature!=frostsave::magic || g_saveControl->layoutVersion!=frostsave::version) return false;
+    InterlockedExchange(&g_saveControl->modReady,1);
+    return true;
+}
+
 LRESULT CALLBACK launchMessageHook(int code, WPARAM wp, LPARAM lp) {
     if (code >= 0 && wp == PM_REMOVE) {
         auto* message = reinterpret_cast<MSG*>(lp);
@@ -1655,12 +1832,14 @@ LRESULT CALLBACK launchMessageHook(int code, WPARAM wp, LPARAM lp) {
             advanceEndlessLaunch();
             advanceOverlayApply();
             advanceSessionControl();
+            advanceSaveControl();
         }
     }
     return CallNextHookEx(g_messageHook, code, wp, lp);
 }
 
 bool installHooks() {
+    if(!installSaveHooks()) return false;
     // Whole instructions, no RIP-relative operands or relative branches.
     constexpr unsigned char prologue[] = {
         0x48,0x8B,0xC4,0x55,0x41,0x54,0x41,0x55,

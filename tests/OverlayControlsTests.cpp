@@ -5,10 +5,10 @@
 #include <fstream>
 
 void savePreview(HWND window) {
-    SetWindowPos(window,nullptr,-3000,-3000,820,410,SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    SetWindowPos(window,nullptr,-3000,-3000,760,604,SWP_NOACTIVATE | SWP_SHOWWINDOW);
     UpdateWindow(window);
     HDC screen = GetDC(nullptr), dc = CreateCompatibleDC(screen);
-    HBITMAP bitmap = CreateCompatibleBitmap(screen,820,410);
+    HBITMAP bitmap = CreateCompatibleBitmap(screen,760,604);
     HGDIOBJ old = SelectObject(dc,bitmap);
     SendMessageW(window,WM_PRINT,reinterpret_cast<WPARAM>(dc),PRF_CLIENT | PRF_CHILDREN | PRF_ERASEBKGND | PRF_NONCLIENT);
     for (HWND edit : g_amountEdits) {
@@ -22,10 +22,10 @@ void savePreview(HWND window) {
     SelectObject(dc,old);
     BITMAPINFO info{};
     info.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);
-    info.bmiHeader.biWidth=820; info.bmiHeader.biHeight=-410;
+    info.bmiHeader.biWidth=760; info.bmiHeader.biHeight=-604;
     info.bmiHeader.biPlanes=1; info.bmiHeader.biBitCount=32; info.bmiHeader.biCompression=BI_RGB;
-    std::vector<unsigned char> pixels(820*410*4);
-    GetDIBits(dc,bitmap,0,410,pixels.data(),&info,DIB_RGB_COLORS);
+    std::vector<unsigned char> pixels(760*604*4);
+    GetDIBits(dc,bitmap,0,604,pixels.data(),&info,DIB_RGB_COLORS);
     BITMAPFILEHEADER file{}; file.bfType=0x4D42;
     file.bfOffBits=sizeof(file)+sizeof(BITMAPINFOHEADER);
     file.bfSize=file.bfOffBits+static_cast<DWORD>(pixels.size());
@@ -50,7 +50,7 @@ int main() {
         cls.hInstance = g_module; cls.lpszClassName = L"FrostOverlayTest";
         RegisterClassW(&cls);
         HWND window = CreateWindowExW(0,cls.lpszClassName,L"Overlay test",WS_POPUP,
-            0,0,820,410,nullptr,nullptr,g_module,nullptr);
+            0,0,760,604,nullptr,nullptr,g_module,nullptr);
         check(window != nullptr, "Test window not created");
         frostoverlay::Values local{{50,30,20,3,80,0}};
         frostoverlay::writeSnapshot(control.local, local);
@@ -84,7 +84,17 @@ int main() {
         control.peer.values = frostoverlay::Values{{0,30,20,3,80,0}};
         control.localHope=4000; control.peerHope=4000;
         control.localDiscontent=81; control.peerDiscontent=1785;
+        control.localState=3; control.peerState=2; control.skewSeconds=-2;
+        wcscpy_s(control.history[0],L"Вы отправили User 20 древесины.");
+        wcscpy_s(control.history[1],L"Получено 10 угля от игрока User.");
+        selectOverlayResource(window,1);
+        check((GetWindowLongW(g_amountSliders[1],GWL_STYLE)&WS_VISIBLE)!=0,"Selected slider hidden");
+        check((GetWindowLongW(g_amountSliders[0],GWL_STYLE)&WS_VISIBLE)==0,"Other slider visible");
         savePreview(window);
+        SendMessageW(window,WM_LBUTTONUP,0,MAKELPARAM(690,447));
+        check(selectedAmount(1)==30,"All must use local stock");
+        SendMessageW(window,WM_LBUTTONUP,0,MAKELPARAM(610,447));
+        check(selectedAmount(1)==50 && !canSend(1,local),"Quick 50 must validate stock");
         DestroyWindow(window);
         std::cout << "PASS: actual edit/slider synchronization, sender-based eligibility, stock returns, bounds, busy and selected transfer.\n";
         return 0;

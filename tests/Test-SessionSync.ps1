@@ -113,6 +113,10 @@ try {
   throw 'Frame jitter generated pause commands'
  }
 
+ # Reload must reissue an unchanged pause value for the newly created timer.
+ $beforeReload=$views[0].ReadInt32(36)
+ $views[0].Write(24,[int]9)
+ Wait-Until { $views[0].ReadInt32(36) -gt $beforeReload } 'pause command reapplied after load generation changes'
  foreach($child in $children) { $child.StandardInput.WriteLine('quit'); $child.StandardInput.Flush() }
  foreach($child in $children) { if(!$child.WaitForExit(5000)) { throw 'Bridge did not exit' } }
  'PASS: shared pause, startup hold, bidirectional catchup and zero frame-jitter pause commands.'

@@ -52,14 +52,23 @@ try {
  $guestBridge.StandardInput.WriteLine('status 60 40 25 4 15 90 -1 -1'); $guestBridge.StandardInput.Flush()
  Start-Sleep -Milliseconds 600
  if($views[0].ReadInt32(8) -ne 5 -or $views[1].ReadInt32(8) -ne 5) { throw 'Duplicate launch changed game state' }
+ # Resources continue reaching overlay IPC without chat spam.
+ foreach($pair in @(@(4000000001,60,90),@(4000000002,50,0))) {
+  $overlayMap=[IO.MemoryMappedFiles.MemoryMappedFile]::OpenExisting("Local\FrostBridgeOverlayV4-$($pair[0])")
+  $overlayView=$overlayMap.CreateViewAccessor()
+  try {
+   if($overlayView.ReadInt32(180)-ne$pair[1] -or $overlayView.ReadInt32(200)-ne$pair[2]) {
+    throw 'Peer resources including food did not reach overlay'
+   }
+  } finally { $overlayView.Dispose(); $overlayMap.Dispose() }
+ }
  foreach($child in $children) { $child.StandardInput.WriteLine('quit'); $child.StandardInput.Flush() }
  foreach($child in $children) { if(!$child.WaitForExit(5000)) { throw 'Bridge did not exit' } }
  $hostLog=$outputs[0].Result; $guestLog=$outputs[1].Result
- if(!$hostLog.Contains('Борис: ресурсы: уголь 60; древесина 40; сталь 25; паровые ядра 4; сырая еда 15; пищевые пайки 90')) { throw 'Missing named guest resources including food' }
- if(!$guestLog.Contains('Анна: ресурсы: уголь 50; древесина 30; сталь 20; паровые ядра 3; сырая еда 80; пищевые пайки 0')) { throw 'Missing named host resources including food' }
  if(!$hostLog.Contains('[game] loading:') -or !$guestLog.Contains('[game] loading:')) { throw 'Missing native dispatch results' }
+ if($hostLog.Contains(': ресурсы:') -or $guestLog.Contains(': ресурсы:')) { throw 'Resource chat spam returned' }
  $hostLog; $guestLog
- 'PASS: host authority, readiness rejection, exact host map propagation, two-phase commit, exactly-once dispatch, Unicode resource labels.'
+ 'PASS: host authority, readiness rejection, exact host map propagation, two-phase commit, exactly-once dispatch, silent resource snapshots.'
 } finally {
  foreach($child in $children) { if(!$child.HasExited) { $child.Kill(); $child.WaitForExit() }; $child.Dispose() }
  foreach($view in $views) { $view.Dispose() }

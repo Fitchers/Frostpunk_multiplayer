@@ -26,6 +26,7 @@
 #include "ConnectionSession.h"
 #include "ResourceReader.h"
 #include "CityVitals.h"
+#include "SaveSync.h"
 #include "../LaunchControl.h"
 #include "../OverlayControl.h"
 #include "../SessionControl.h"
@@ -34,7 +35,7 @@
 namespace {
 
 constexpr std::uint32_t kProtocolMagic = 0x31504246;  // "FBP1"
-constexpr std::uint16_t kProtocolVersion = 12;
+constexpr std::uint16_t kProtocolVersion = 13;
 constexpr int kChannel = 17;
 constexpr int kSendUnreliable = 0;
 constexpr int kSendReliable = 2;
@@ -59,6 +60,7 @@ enum class MessageType : std::uint16_t {
     startGo = 14,
     speedRequest = 15,
     speedState = 16,
+    checkpoint = 17,
 };
 
 #pragma pack(push, 1)
@@ -366,7 +368,14 @@ public:
         return control_->applyResult;
     }
 
-    void notify(const std::string& utf8) {
+    void session(LONG local, LONG peer, LONG skew) {
+        if (!control_) return;
+        InterlockedExchange(&control_->localState, local);
+        InterlockedExchange(&control_->peerState, peer);
+        InterlockedExchange(&control_->skewSeconds, skew);
+    }
+
+    void notify(const std::string& utf8, bool transfer = false) {
         if (!control_) return;
         wchar_t text[160]{};
         MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, text,
@@ -374,6 +383,15 @@ public:
         wcsncpy_s(control_->notification, text, _TRUNCATE);
         MemoryBarrier();
         InterlockedIncrement(&control_->notificationSequence);
+        if (transfer) {
+            InterlockedIncrement(&control_->historySequence);
+            MemoryBarrier();
+            for (int i = 2; i > 0; --i)
+                wcsncpy_s(control_->history[i], control_->history[i - 1], _TRUNCATE);
+            wcsncpy_s(control_->history[0], text, _TRUNCATE);
+            MemoryBarrier();
+            InterlockedIncrement(&control_->historySequence);
+        }
     }
 
     void busy(bool value) {
@@ -477,7 +495,9 @@ public:
     LONG commandPause(bool paused) {
         if (!control_ || !InterlockedCompareExchange(&control_->modReady, 0, 0)) return 0;
         const LONG current = InterlockedCompareExchange(&control_->pauseCommandSequence, 0, 0);
-        if (current && (control_->pauseCommandValue != 0) == paused) return current;
+        const LONG generation = InterlockedCompareExchange(&control_->loadGeneration, 0, 0);
+        if (current && generation == lastCommandGeneration_ && (control_->pauseCommandValue != 0) == paused) return current;
+        lastCommandGeneration_ = generation;
         InterlockedExchange(&control_->pauseCommandValue, paused ? 1 : 0);
         MemoryBarrier();
         return InterlockedIncrement(&control_->pauseCommandSequence);
@@ -503,6 +523,7 @@ private:
     HANDLE mapping_ = nullptr;
     frostsession::Control* control_ = nullptr;
     LONG lastPauseEvent_ = 0;
+    LONG lastCommandGeneration_ = -1;
     LONG lastSpeedEvent_ = 0;
 };
 
@@ -1006,6 +1027,21 @@ public:
           started_(std::chrono::steady_clock::now()), output_(std::move(output)) {
         overlay_.open(frostpunkProcessId_, playerName_);
         gameSession_.open(frostpunkProcessId_);
+        // Steam P2P has two symmetric endpoints. Elect one stable coordinator.
+        if(dynamic_cast<SteamTransport*>(&transport_)) host_=local_<expectedPeer_;
+        wchar_t appData[32768]{};
+        const DWORD appDataLength=GetEnvironmentVariableW(L"APPDATA",appData,static_cast<DWORD>(std::size(appData)));
+        if(appDataLength && appDataLength<std::size(appData)) {
+            saves_=std::make_unique<frostsave::Sync>(frostpunkProcessId_,playerName_,host_,
+                std::filesystem::path(appData)/L"11bitstudios"/L"Frostpunk"/L"Default"/L"saves");
+            saves_->send=[this](const frostsave::Packet& packet) {
+                sendPacket(makePacket(MessageType::checkpoint,++sequence_,local_,packet),true);
+            };
+            saves_->log=[this](const std::string& message) { print(message); overlay_.notify(message); };
+            saves_->kick=[this] { transport_.close(); };
+            saves_->state=[this] { auto s=gameSession_.state(); return frostsave::State{s.loaded,s.paused,s.generation}; };
+            saves_->trading=[this] { return outgoingTransfer_.stage!=TransferStage::none || incomingTransfer_.active; };
+        }
         nextTransferId_ = static_cast<std::uint32_t>(timestampMs()) ^
                           static_cast<std::uint32_t>(local_);
     }
@@ -1148,6 +1184,7 @@ private:
     }
 
     void beginOverlayTransfer(LONG resource, LONG amount) {
+        if(saves_ && saves_->active()) { overlay_.notify("Дождитесь окончания сохранения или загрузки."); return; }
         if (!connected_ || outgoingTransfer_.stage != TransferStage::none ||
             incomingTransfer_.active) {
             overlay_.notify("Передача уже выполняется или соединение отсутствует.");
@@ -1198,10 +1235,10 @@ private:
         if (outgoingTransfer_.stage != TransferStage::awaitingPeer ||
             result.id != outgoingTransfer_.id) return;
         if (result.status == 1 && result.applied == outgoingTransfer_.amount) {
-            const std::string message = "Отправлено " + std::to_string(outgoingTransfer_.amount) + " " +
-                std::string(resourceName(outgoingTransfer_.resource)) + " игроку " + peerName_ + ".";
+            const std::string message = "Вы отправили " + peerName_ + " " + std::to_string(outgoingTransfer_.amount) + " " +
+                std::string(resourceName(outgoingTransfer_.resource)) + ".";
             print("[trade] " + message);
-            overlay_.notify(message);
+            overlay_.notify(message, true);
             overlay_.busy(false);
             outgoingTransfer_ = {};
             return;
@@ -1299,7 +1336,7 @@ private:
                         std::string(resourceName(incomingTransfer_.request.resource)) +
                         " от игрока " + peerName_ + ".";
                     print("[trade] " + message);
-                    overlay_.notify(message);
+                    overlay_.notify(message, true);
                 }
                 incomingTransfer_ = {};
             }
@@ -1348,7 +1385,7 @@ private:
             pendingPause_.deadline = std::chrono::steady_clock::now() +
                 std::chrono::milliseconds((std::min)(pause.delayMs, 5000u));
         } else if (!(startCommitted_ && !sessionBarrierReleased_ && !paused)) {
-            gameSession_.commandPause(paused || peerPauseRequested_ || clockHold_);
+            gameSession_.commandPause(paused || peerPauseRequested_ || clockHold_ || (saves_ && saves_->active()));
         }
         print(paused ? "[sync] второй игрок поставил общую паузу."
                      : "[sync] второй игрок снял общую паузу.");
@@ -1372,6 +1409,11 @@ private:
 
     void pollGameSession(const std::chrono::steady_clock::time_point now) {
         const auto localState = gameSession_.state();
+        const bool peerFresh = connected_ && peerSession_ && now - peerSessionReceived_ < std::chrono::seconds(2);
+        overlay_.session(!localState.available ? 0 : !localState.loaded ? 1 : localState.paused ? 3 : 2,
+            !peerFresh ? 0 : !peerSession_->loaded ? 1 : peerSession_->paused ? 3 : 2,
+            peerFresh && localState.loaded && peerSession_->loaded
+                ? static_cast<LONG>((localState.gameTimeMs - peerSession_->gameTimeMs) / 1000) : 0);
         const auto speed = gameSession_.localSpeedEvent();
         if (connected_) {
             if (speed) {
@@ -1382,7 +1424,7 @@ private:
             }
         }
         if (pendingPause_.active && now >= pendingPause_.deadline) {
-            gameSession_.commandPause(pendingPause_.paused || peerPauseRequested_ || clockHold_);
+            gameSession_.commandPause(pendingPause_.paused || peerPauseRequested_ || clockHold_ || (saves_ && saves_->active()));
             pendingPause_ = {};
         }
         if (const auto pause = gameSession_.localPauseEvent()) {
@@ -1407,10 +1449,10 @@ private:
                 now.time_since_epoch()).count();
             const bool hold = waiting || clockCorrection_.update(localState.gameTimeMs,
                 peerSession_->gameTimeMs, wallMs, gameSession_.localPause() || peerPauseRequested_);
-            gameSession_.commandPause(hold || peerPauseRequested_);
+            gameSession_.commandPause(hold || peerPauseRequested_ || (saves_ && saves_->active()));
             if (hold != clockHold_) {
                 clockHold_ = hold;
-                gameSession_.commandPause(hold || peerPauseRequested_);
+                gameSession_.commandPause(hold || peerPauseRequested_ || (saves_ && saves_->active()));
                 // Frame-sized corrections are normal; do not flood the chat.
                 if (hold && (waiting || localState.gameTimeMs - peerSession_->gameTimeMs > 60000) &&
                     !clockWaitReported_) {
@@ -1427,7 +1469,7 @@ private:
             localState.loaded && peerSession_->loaded &&
             peerSession_->request == startRequest_) {
             sessionBarrierReleased_ = true;
-            gameSession_.commandPause(clockHold_ || peerPauseRequested_);
+            gameSession_.commandPause(clockHold_ || peerPauseRequested_ || (saves_ && saves_->active()));
         }
     }
 
@@ -1569,7 +1611,16 @@ private:
     }
 
     void processCommand(const std::string& line) {
+        if(line.rfind("save ",0)==0 || line.rfind("load ",0)==0) {
+            if(!connected_ || !saves_) { print("[save] Connect both players first."); return; }
+            const auto text=line.substr(5);
+            int size=MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,text.data(),static_cast<int>(text.size()),nullptr,0);
+            std::wstring slot(size,L'\0');
+            if(size) MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,text.data(),static_cast<int>(text.size()),slot.data(),size);
+            saves_->request(line[0]=='s'?frostsave::save:frostsave::load,slot); return;
+        }
         if (line == "start") {
+            if(saves_ && saves_->active()) { print("[save] Wait for the checkpoint operation."); return; }
             if (!host_ || !connected_ || startCommitted_ || waitingStart_) {
                 print("[game] rejected: запуск доступен только подключённому LAN-хосту, один раз за сессию.");
                 return;
@@ -1665,6 +1716,8 @@ private:
                       (header.type == MessageType::hello ? " (hello)" : " (connected)"));
                 if (header.type == MessageType::hello) sendHello(MessageType::helloAck);
                 overlay_.connected(playerName_, peerName_);
+                if(saves_) saves_->connected(true);
+                print(host_?"[role] host":"[role] client");
                 sendPause(gameSession_.localPause());
                 if (host_ && speedRevision_) sendSpeed(MessageType::speedState, sharedSpeed_, speedRevision_);
             } else if (connected_ &&
@@ -1681,7 +1734,6 @@ private:
                 std::memcpy(&city, payload, sizeof(city));
                 if (city.hope < -1 || city.hope > 10000 ||
                     city.discontent < -1 || city.discontent > 10000) continue;
-                resourceLine(peerName_, city);
                 overlay_.peer(city);
             } else if (connected_ && header.type == MessageType::transferRequest &&
                        header.payloadBytes == sizeof(TransferRequestPayload)) {
@@ -1708,6 +1760,10 @@ private:
                 SessionStatePayload state{};
                 std::memcpy(&state, payload, sizeof(state));
                 receiveSessionState(state);
+            } else if (connected_ && header.type == MessageType::checkpoint && header.payloadBytes==sizeof(frostsave::Packet)) {
+                frostsave::Packet checkpoint{};
+                std::memcpy(&checkpoint,payload,sizeof(checkpoint));
+                if(saves_) saves_->receive(checkpoint);
             } else if (connected_ && header.type == MessageType::chat) {
                 print("[peer] " + std::string(reinterpret_cast<const char*>(payload),
                                                header.payloadBytes));
@@ -1735,6 +1791,7 @@ private:
             pollOverlay(now);
             pollGameSession(now);
             pollMapLaunch(now);
+            if(saves_) saves_->poll();
             if (waitingStart_ && now > launchDeadline_) {
                 waitingStart_ = false;
                 print("[game] rejected: второй игрок не подтвердил готовность за 10 секунд.");
@@ -1770,7 +1827,6 @@ private:
                     {
                         sendPacket(makePacket(MessageType::citySnapshot, ++sequence_, local_,
                                               *city), false);
-                        resourceLine(playerName_, *city);
                         overlay_.local(*city);
                         lastLocalCity_ = *city;
                     }
@@ -1786,6 +1842,7 @@ private:
             queueChanged_.wait_for(lock, std::chrono::milliseconds(25));
         }
         transport_.close();
+        if(saves_) saves_->connected(false);
         overlay_.close();
         gameSession_.close();
     }
@@ -1797,6 +1854,7 @@ private:
     std::string cityName_;
     bool watchFrostpunk_ = false;
     DWORD frostpunkProcessId_ = 0;
+    std::unique_ptr<frostsave::Sync> saves_;
     bool host_ = false, waitingStart_ = false, prepared_ = false;
     bool hostMapPreparing_ = false, waitingClientMap_ = false;
     bool clientMapPreparing_ = false, clientMapPrepared_ = false;
