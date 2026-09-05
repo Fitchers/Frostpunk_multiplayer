@@ -35,7 +35,7 @@
 namespace {
 
 constexpr std::uint32_t kProtocolMagic = 0x31504246;  // "FBP1"
-constexpr std::uint16_t kProtocolVersion = 13;
+constexpr std::uint16_t kProtocolVersion = 14;
 constexpr int kChannel = 17;
 constexpr int kSendUnreliable = 0;
 constexpr int kSendReliable = 2;
@@ -1497,7 +1497,7 @@ private:
     }
 
     void receiveStart(MessageType type, const StartPayload& start) {
-        if (!connected_ || !start.request || std::strcmp(transport_.name(), "lan") != 0) return;
+        if (!connected_ || !start.request) return;
         if (type == MessageType::startPrepare && !host_) {
             if (startCommitted_ || start.request < startRequest_) return;
             startRequest_ = start.request;
@@ -1511,7 +1511,7 @@ private:
                 print("[game] rejected: оба игрока должны находиться в меню подключения с обновлённым модом.");
                 return;
             }
-            const LONG state = requestLocalPrepare(-1);
+            const LONG state = requestLocalPrepare(selectedMapIndex_);
             if (state != frostlaunch::prepareRequested) {
                 print("[game] rejected: хост не смог открыть выбор карты.");
                 return;
@@ -1619,10 +1619,10 @@ private:
             if(size) MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,text.data(),static_cast<int>(text.size()),slot.data(),size);
             saves_->request(line[0]=='s'?frostsave::save:frostsave::load,slot); return;
         }
-        if (line == "start") {
+        if (line == "start" || line == "start story") {
             if(saves_ && saves_->active()) { print("[save] Wait for the checkpoint operation."); return; }
             if (!host_ || !connected_ || startCommitted_ || waitingStart_) {
-                print("[game] rejected: запуск доступен только подключённому LAN-хосту, один раз за сессию.");
+                print("[game] rejected: запуск доступен только подключённому хосту, один раз за сессию.");
                 return;
             }
             if (localLaunch().state != frostlaunch::ready) {
@@ -1630,7 +1630,7 @@ private:
                 return;
             }
             ++startRequest_;
-            selectedMapIndex_ = -1;
+            selectedMapIndex_ = line == "start story" ? frostlaunch::chooseStory : -1;
             hostMapPreparing_ = clientMapPreparing_ = clientMapPrepared_ = false;
             waitingClientMap_ = false;
             waitingStart_ = true;

@@ -594,6 +594,8 @@ void __fastcall mainMenuBindButtonsHook(void* panel) {
 
 void __fastcall scenariosPanelUpdateHook(void* panel) {
     g_originalScenariosPanelUpdate(panel);
+    if (g_launchControl && frostlaunch::isStory(g_launchControl->mapIndex) && g_launchStage == 1)
+        g_endlessConfig = panel;
     if (g_multiplayerMode.load(std::memory_order_acquire)) {
         configureConnectionPanel(panel);
     }
@@ -1550,6 +1552,21 @@ void __fastcall scenariosStartCallbackHook(void* owner, void* event) {
         if (index >= 0 && index <= 1) g_openConnectionForm(index);
         return;
     }
+    if (g_launchControl && frostlaunch::isStory(g_launchControl->mapIndex) &&
+        g_launchStage >= 1 && g_launchStage <= 3) {
+        if (g_launchStage == 1 && g_launchControl->mapIndex == frostlaunch::chooseStory) {
+            int index = -1, count = 0;
+            auto* panel = static_cast<unsigned char*>(owner);
+            if (!safeRead(panel + 0x1B0, index) || !safeRead(panel + 0x1A0, count) ||
+                index < 0 || index >= count || count > 64) return;
+            g_endlessConfig = owner;
+            g_selectedMapIndex = frostlaunch::storyBase + index;
+            InterlockedExchange(&g_launchControl->mapIndex, g_selectedMapIndex);
+            g_launchStage = 3;
+            InterlockedExchange(&g_launchControl->state, frostlaunch::prepared);
+        }
+        return;
+    }
     g_originalScenariosStartCallback(owner, event);
 }
 
@@ -1644,6 +1661,67 @@ void advanceEndlessLaunch() {
         }
         if (state == frostlaunch::prepared || state == frostlaunch::dispatched ||
             state == frostlaunch::failed) return;
+        if (frostlaunch::isStory(g_launchControl->mapIndex)) {
+            if (state == frostlaunch::prepareRequested && !g_launchStage) {
+                if (!g_multiplayerMode.load() || !g_connectionPanel.load()) {
+                    InterlockedExchange(&g_launchControl->state, frostlaunch::failed);
+                    return;
+                }
+                g_launchStage = 1;
+                void* scenarioPanel = g_connectionPanel.load();
+                g_endlessConfig = scenarioPanel;
+                g_mapSelectionIssued = false;
+                g_launchDeadline = GetTickCount64() + 600000;
+                g_multiplayerMode.store(false);
+                restoreConnectionButtons();
+                g_connectionPanel.store(nullptr);
+                alignas(8) unsigned char event[0x20]{};
+                *reinterpret_cast<DWORD*>(event + 0x18) = 0x5B;
+                g_originalMenuPanelCallback(nullptr, event);
+                // This screen is already open as the transport selector. Merely
+                // showing it again retains our labels and hidden rows. Native
+                // SetView(0) clears/recreates scenario rows and localized labels.
+                using SetScenarioView = void(__fastcall*)(void*, int);
+                reinterpret_cast<SetScenarioView>(g_gameBase + 0x1A79390)(scenarioPanel, 0);
+                return;
+            }
+            if (GetTickCount64() > g_launchDeadline) {
+                InterlockedExchange(&g_launchControl->state, frostlaunch::failed);
+                return;
+            }
+            if (state == frostlaunch::prepareRequested && g_endlessConfig &&
+                g_launchControl->mapIndex >= frostlaunch::storyBase) {
+                const int requested = g_launchControl->mapIndex - frostlaunch::storyBase;
+                int count = 0, selected = -1;
+                auto* panel = static_cast<unsigned char*>(g_endlessConfig);
+                if (!safeRead(panel + 0x1A0, count) || requested >= count || count > 64) {
+                    InterlockedExchange(&g_launchControl->state, frostlaunch::failed);
+                    return;
+                }
+                if (!g_mapSelectionIssued) {
+                    alignas(8) unsigned char event[0x20]{};
+                    *reinterpret_cast<DWORD*>(event + 0x18) = requested;
+                    g_originalScenarioRowCallback(g_endlessConfig, event);
+                    g_mapSelectionIssued = true;
+                    return;
+                }
+                void* start = panelElement(g_endlessConfig, kScenarioStartButtonOffset);
+                std::uint32_t flags = 0;
+                if (!safeRead(panel + 0x1B0, selected) || selected != requested ||
+                    !start || !safeRead(static_cast<unsigned char*>(start) + 0x270, flags) || !(flags & 8)) return;
+                g_selectedMapIndex = g_launchControl->mapIndex;
+                g_launchStage = 3;
+                InterlockedExchange(&g_launchControl->state, frostlaunch::prepared);
+            } else if (state == frostlaunch::commitRequested && g_launchStage == 3 && g_endlessConfig) {
+                g_launchStage = 4;
+                g_launchDeadline = GetTickCount64() + 90000;
+                // Retain the game's entitlement and progression checks.
+                g_originalScenariosStartCallback(g_endlessConfig, nullptr);
+            } else if (state == frostlaunch::commitRequested && g_launchStage == 4 && g_sessionLoaded) {
+                InterlockedExchange(&g_launchControl->state, frostlaunch::dispatched);
+            }
+            return;
+        }
         if (state == frostlaunch::commitRequested) {
             if (g_launchStage == 4) {
                 if (g_sessionLoaded) {

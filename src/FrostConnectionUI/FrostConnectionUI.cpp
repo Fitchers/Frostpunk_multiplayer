@@ -14,7 +14,7 @@
 namespace {
 constexpr int kName=101, kAddress=102, kPort=103, kHost=104, kJoin=105,
               kStop=106, kLog=107, kStatus=108, kChat=109, kSend=110, kStart=111,
-              kSaveName=112,kSave=113,kLoad=114;
+              kSaveName=112,kSave=113,kLoad=114,kStory=115;
 constexpr wchar_t kClass[] = L"FrostBridgeConnectionUI";
 HWND g_window{};
 HFONT g_font{};
@@ -66,6 +66,7 @@ void controls(bool active) {
     EnableWindow(GetDlgItem(g_window,kChat),active);
     EnableWindow(GetDlgItem(g_window,kSend),active);
     EnableWindow(GetDlgItem(g_window,kStart),active && g_host && g_connected && !g_startPending);
+    EnableWindow(GetDlgItem(g_window,kStory),active && g_host && g_connected && !g_startPending);
     for(int id:{kSaveName,kSave,kLoad}) EnableWindow(GetDlgItem(g_window,id),active && g_host && g_connected);
 }
 void stopSession() {
@@ -86,7 +87,7 @@ void pumpOutput() {
                 g_startPending=false; controls(true); status(L"Запуск отменён — подробности в чате");
             }
             if(line.rfind("[game] launching:",0)==0 || line.rfind("[game] loading:",0)==0)
-                status(L"Бесконечный режим запускается. Окно чата можно свернуть.");
+                status(L"Карта запускается. Окно чата можно свернуть.");
             if(line.rfind("[game] failed:",0)==0 || line.rfind("[game] peer-failed:",0)==0)
                 status(L"Ошибка запуска города — подробности в чате");
             if(line.rfind("[connection] disconnected",0)==0) {
@@ -142,8 +143,9 @@ LRESULT CALLBACK windowProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
         control(L"BUTTON",L"Создать",kHost,20,177,180,34,WS_TABSTOP);
         control(L"BUTTON",L"Подключиться",kJoin,217,177,220,34,WS_TABSTOP);
         control(L"BUTTON",L"Отключиться",kStop,454,177,206,34,WS_TABSTOP);
-        control(L"STATIC",L"Введите имя и выберите действие",kStatus,20,220,440,52);
-        control(L"BUTTON",L"Начать игру",kStart,474,225,186,38,WS_TABSTOP);
+        control(L"STATIC",L"Введите имя и выберите действие",kStatus,20,220,260,52);
+        control(L"BUTTON",L"Бесконечный",kStart,290,225,180,38,WS_TABSTOP);
+        control(L"BUTTON",L"Сюжетный сценарий",kStory,480,225,180,38,WS_TABSTOP);
         control(L"EDIT",L"survival",kSaveName,20,280,280,30,WS_TABSTOP|ES_AUTOHSCROLL);
         control(L"BUTTON",L"Сохранить всем",kSave,313,280,167,30,WS_TABSTOP);
         control(L"BUTTON",L"Загрузить всем",kLoad,493,280,167,30,WS_TABSTOP);
@@ -173,9 +175,10 @@ LRESULT CALLBACK windowProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
                     g_session->send(std::string(LOWORD(wp)==kSave?"save ":"load ")+toUtf8(field(kSaveName)));
                 break;
             case kStop: stopSession(); status(L"Отключено"); log(L"Сессия остановлена."); break;
+            case kStory:
             case kStart: {
                 if (!g_session || !g_host || !g_connected || g_startPending) break;
-                g_session->send("start");
+                g_session->send(LOWORD(wp) == kStory ? "start story" : "start");
                 g_startPending=true; controls(true); status(L"Проверка готовности двух игр…");
                 break;
             }

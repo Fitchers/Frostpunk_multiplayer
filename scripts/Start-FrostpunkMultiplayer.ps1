@@ -54,7 +54,7 @@ function Has-CurrentMod([int]$GameId) {
     try {
         $map=[IO.MemoryMappedFiles.MemoryMappedFile]::OpenExisting("Local\FrostBridgeLaunchV3-$GameId")
         $view=$map.CreateViewAccessor()
-        $valid=$view.ReadUInt32(0)-eq[uint32]0x324C4246 -and $view.ReadUInt32(4)-eq[uint32]3
+        $valid=$view.ReadUInt32(0)-eq[uint32]0x324C4246 -and $view.ReadUInt32(4)-eq[uint32]4
         $view.Dispose();$map.Dispose()
         if(!$valid) { return $false }
         $map=[IO.MemoryMappedFiles.MemoryMappedFile]::OpenExisting("Local\FrostBridgeOverlayV4-$GameId")
@@ -114,4 +114,4 @@ Start-Process -FilePath $bridge -WorkingDirectory $bin -ArgumentList @(
     '--address','127.0.0.1','--port',"$Port",'--auto-join') | Out-Null
 
 Write-Host "Ready: host '$HostName' PID $($hostGame.Id), client '$ClientName' PID $($clientGame.Id), LAN 127.0.0.1:$Port."
-Write-Host 'Only one action remains: click Start Game in the host connection window.'
+Write-Host 'Choose Endless or Story Scenario in the host connection window, then select the map in Frostpunk.'

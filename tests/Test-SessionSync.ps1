@@ -22,7 +22,7 @@ try {
   $view.Write(12,[int]1); $view.Write(16,[int]0)
   $maps+=,$map; $views+=,$view
   $launch=[IO.MemoryMappedFiles.MemoryMappedFile]::CreateNew("Local\FrostBridgeLaunchV3-$id",16)
-  $launchView=$launch.CreateViewAccessor(); $launchView.Write(0,[uint32]0x324C4246); $launchView.Write(4,[uint32]3); $launchView.Write(8,[int]1); $launchView.Write(12,[int]-1)
+  $launchView=$launch.CreateViewAccessor(); $launchView.Write(0,[uint32]0x324C4246); $launchView.Write(4,[uint32]4); $launchView.Write(8,[int]1); $launchView.Write(12,[int]-1)
   $launchMaps+=,$launch; $launchViews+=,$launchView
  }
  $listener=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,0)

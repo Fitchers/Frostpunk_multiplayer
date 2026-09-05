@@ -1,4 +1,4 @@
-param([string]$Bridge = (Join-Path $PSScriptRoot '..\bin\FrostBridgeNet.exe'))
+param([string]$Bridge = (Join-Path $PSScriptRoot '..\bin\FrostBridgeNet.exe'), [switch]$Story)
 $ErrorActionPreference='Stop'
 $maps=@(); $views=@(); $children=@(); $outputs=@()
 function Wait-Until([scriptblock]$Condition,[string]$Description) {
@@ -19,7 +19,7 @@ try {
  # Synthetic per-PID mailboxes. No live Frostpunk memory or files are modified.
  foreach($id in 4000000001,4000000002) {
   $map=[IO.MemoryMappedFiles.MemoryMappedFile]::CreateNew("Local\FrostBridgeLaunchV3-$id",16)
-  $view=$map.CreateViewAccessor(); $view.Write(0,[uint32]0x324C4246); $view.Write(4,[uint32]3); $view.Write(8,[int]1); $view.Write(12,[int]-1)
+  $view=$map.CreateViewAccessor(); $view.Write(0,[uint32]0x324C4246); $view.Write(4,[uint32]4); $view.Write(8,[int]1); $view.Write(12,[int]-1)
   $maps+=,$map; $views+=,$view
  }
  $listener=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,0)
@@ -38,12 +38,15 @@ try {
  Start-Sleep -Milliseconds 500
  if($views[0].ReadInt32(8) -ne 1 -or $views[1].ReadInt32(8) -ne 0) { throw 'Unready client was launched' }
  $views[1].Write(8,[int]1)
- $hostBridge.StandardInput.WriteLine('start'); $hostBridge.StandardInput.Flush()
+ $command=if($Story){'start story'}else{'start'}
+ $mapChoice=if($Story){1000}else{4}
+ $hostBridge.StandardInput.WriteLine($command); $hostBridge.StandardInput.Flush()
  Wait-Until { $views[0].ReadInt32(8) -eq 2 } 'host map preparation request'
  if($views[1].ReadInt32(8) -ne 1) { throw 'Client prepared before host selected a map' }
- $views[0].Write(12,[int]4); $views[0].Write(8,[int]3)
- Wait-Until { $views[1].ReadInt32(8) -eq 2 -and $views[1].ReadInt32(12) -eq 4 } 'exact host map reaches client'
- $views[1].Write(12,[int]4); $views[1].Write(8,[int]3)
+ if($Story -and $views[0].ReadInt32(12) -ne -2) { throw 'Story selection not requested' }
+ $views[0].Write(12,[int]$mapChoice); $views[0].Write(8,[int]3)
+ Wait-Until { $views[1].ReadInt32(8) -eq 2 -and $views[1].ReadInt32(12) -eq $mapChoice } 'exact host map reaches client'
+ $views[1].Write(12,[int]$mapChoice); $views[1].Write(8,[int]3)
  Wait-Until { $views[0].ReadInt32(8) -eq 4 -and $views[1].ReadInt32(8) -eq 4 } 'both synchronized commits'
  foreach($view in $views) { $view.Write(8,[int]5) }
  $hostBridge.StandardInput.WriteLine('start'); $hostBridge.StandardInput.Flush()

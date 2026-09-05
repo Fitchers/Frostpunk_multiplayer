@@ -9,7 +9,7 @@ import pefile
 p = argparse.ArgumentParser()
 p.add_argument('pid', type=int)
 p.add_argument('base', type=lambda s: int(s, 0))
-p.add_argument('mode', choices=['strings', 'disasm', 'refs', 'calls', 'read', 'globals', 'session'])
+p.add_argument('mode', choices=['strings', 'disasm', 'refs', 'calls', 'read', 'globals', 'session', 'weather'])
 p.add_argument('target')
 p.add_argument('--size', type=lambda s: int(s, 0), default=0x200)
 a = p.parse_args()
@@ -26,7 +26,19 @@ def read(addr, size):
     return b.raw
 try:
     pe = pefile.PE(data=read(a.base,0x1000), fast_load=True)
-    if a.mode == 'session':
+    if a.mode == 'weather':
+        def ptr(address): return struct.unpack('<Q', read(address, 8))[0]
+        weather = ptr(a.base + 0x2B687A0)
+        print('weather_system', hex(weather), 'current_entry', hex(ptr(weather + 0x150)))
+        timeline = ptr(weather + 0x118)
+        count = struct.unpack('<i', read(weather + 0x120, 4))[0]
+        print('timeline_count', count, 'index', struct.unpack('<i', read(weather + 0x148, 4))[0])
+        if 0 <= count <= 256:
+            for index in range(min(count, 12)):
+                tick, entry = struct.unpack('<qQ', read(timeline + index * 16, 16))
+                name = read(ptr(entry), 80).split(b'\0')[0].decode('ascii', errors='replace')
+                print(index, 'ticks', tick, 'weather', name, 'guid', read(entry + 8, 16).hex())
+    elif a.mode == 'session':
         controller = struct.unpack('<Q', read(a.base + 0x2B6A710, 8))[0]
         timer = struct.unpack('<Q', read(a.base + 0x2B68510, 8))[0]
         ticks = struct.unpack('<q', read(controller + 0xB0, 8))[0]
