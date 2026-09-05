@@ -95,6 +95,16 @@ int main() {
         check(selectedAmount(1)==30,"All must use local stock");
         SendMessageW(window,WM_LBUTTONUP,0,MAKELPARAM(610,447));
         check(selectedAmount(1)==50 && !canSend(1,local),"Quick 50 must validate stock");
+        // Closing must be immediate even if the maintenance worker is busy:
+        // do not pump timers or send the worker's old WM_TIMER fallback here.
+        g_overlayWindow = window;
+        g_overlayExpanded.store(true);
+        ShowWindow(window, SW_SHOWNOACTIVATE);
+        check(IsWindowVisible(window) != FALSE, "Toggle test panel not visible");
+        overlayButtonWindowProc(window, WM_LBUTTONUP, 0, 0);
+        check(!g_overlayExpanded.load() && !IsWindowVisible(window),
+            "Collapse waited for maintenance instead of hiding immediately");
+        g_overlayWindow = nullptr;
         DestroyWindow(window);
         std::cout << "PASS: actual edit/slider synchronization, sender-based eligibility, stock returns, bounds, busy and selected transfer.\n";
         return 0;

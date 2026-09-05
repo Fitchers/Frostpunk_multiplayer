@@ -9,7 +9,7 @@ import pefile
 p = argparse.ArgumentParser()
 p.add_argument('pid', type=int)
 p.add_argument('base', type=lambda s: int(s, 0))
-p.add_argument('mode', choices=['strings', 'disasm', 'refs', 'calls', 'read', 'globals'])
+p.add_argument('mode', choices=['strings', 'disasm', 'refs', 'calls', 'read', 'globals', 'session'])
 p.add_argument('target')
 p.add_argument('--size', type=lambda s: int(s, 0), default=0x200)
 a = p.parse_args()
@@ -26,7 +26,25 @@ def read(addr, size):
     return b.raw
 try:
     pe = pefile.PE(data=read(a.base,0x1000), fast_load=True)
-    if a.mode == 'globals':
+    if a.mode == 'session':
+        controller = struct.unpack('<Q', read(a.base + 0x2B6A710, 8))[0]
+        timer = struct.unpack('<Q', read(a.base + 0x2B68510, 8))[0]
+        ticks = struct.unpack('<q', read(controller + 0xB0, 8))[0]
+        scale = struct.unpack('<i', read(a.base + 0x2B70CC0, 4))[0]
+        print('calendar_ms', int(ticks / 2147483648 * 3600000 / scale),
+              'user_pause', read(controller + 0xE0, 1)[0],
+              'loading', read(a.base + 0x2A602DD, 1)[0])
+        reasons = struct.unpack('<Q', read(timer + 0xB8, 8))[0]
+        count = struct.unpack('<i', read(timer + 0xC0, 4))[0]
+        print('reason_count', count)
+        if 0 <= count <= 128:
+            for index in range(count):
+                pointer = struct.unpack('<Q', read(reasons + index * 8, 8))[0]
+                try:
+                    print('reason', read(pointer, 80).split(b'\0')[0].decode('ascii', errors='replace'))
+                except RuntimeError:
+                    print('unreadable reason')
+    elif a.mode == 'globals':
         start = int(a.target,0)
         block = read(a.base+start,a.size)
         for off in range(0,len(block)-7,8):

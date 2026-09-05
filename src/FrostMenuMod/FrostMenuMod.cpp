@@ -137,6 +137,7 @@ std::atomic<bool> g_multiplayerMode = false;
 frostlaunch::Control* g_launchControl = nullptr;
 HHOOK g_messageHook = nullptr;
 UINT g_launchMessage = 0;
+std::atomic<bool> g_sessionTickPending{false};
 DWORD g_uiThread = 0;
 int g_launchStage = 0; // accessed only on the game's window thread
 int g_nextMapIndex = 0;
@@ -819,7 +820,12 @@ void advanceSessionControl() {
         auto reader = [](std::uintptr_t address, void* destination, std::size_t size) {
             return safeCopyMemory(address, destination, size);
         };
-        const bool loaded = frostbridge::resources::readResolved(reader, g_gameBase).has_value();
+        // Resource objects exist during deserialization, before the city is ready.
+        // IsLoadingScreenActive (native predicate at RVA F283C0) reads this byte.
+        unsigned char loadingScreen = 1;
+        const bool loaded = safeCopyMemory(g_gameBase + 0x2A602DD,
+            &loadingScreen, sizeof(loadingScreen)) && !loadingScreen &&
+            frostbridge::resources::readResolved(reader, g_gameBase).has_value();
         if (loaded != g_sessionLoaded) {
             g_sessionLoaded = loaded;
             justLoaded = loaded;
@@ -1309,7 +1315,12 @@ LRESULT CALLBACK overlayButtonWindowProc(HWND window, UINT message, WPARAM wp, L
         g_overlayExpanded.store(!g_overlayExpanded.load(std::memory_order_acquire),
                                 std::memory_order_release);
         InvalidateRect(window, nullptr, FALSE);
-        if (g_overlayWindow) InvalidateRect(g_overlayWindow, nullptr, FALSE);
+        if (g_overlayWindow) {
+            // Both windows belong to this UI thread. Update visibility now,
+            // independently of menu scanning and of the network polling loop.
+            SendMessageW(g_overlayWindow, WM_TIMER, 1, 0);
+            InvalidateRect(g_overlayWindow, nullptr, FALSE);
+        }
         return 0;
     case WM_TIMER: {
         HWND game = findGameWindow();
@@ -1416,6 +1427,8 @@ DWORD WINAPI overlayThread(void*) {
         return 1;
     }
     SetLayeredWindowAttributes(g_overlayButtonWindow, 0, 225, LWA_ALPHA);
+    SetTimer(g_overlayWindow, 1, 100, nullptr);
+    SetTimer(g_overlayButtonWindow, 1, 100, nullptr);
     logLine(L"In-game multiplayer resource overlay initialized.");
     MSG message{};
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
@@ -1833,9 +1846,30 @@ LRESULT CALLBACK launchMessageHook(int code, WPARAM wp, LPARAM lp) {
             advanceOverlayApply();
             advanceSessionControl();
             advanceSaveControl();
+            g_sessionTickPending.store(false, std::memory_order_release);
         }
     }
     return CallNextHookEx(g_messageHook, code, wp, lp);
+}
+
+// Own the game-thread hook and its wakeups independently of expensive menu scans.
+// A single outstanding message bounds the queue while the native loader is busy.
+DWORD WINAPI sessionPumpThread(void*) {
+    for (;;) {
+        if (!g_messageHook) {
+            if (HWND window = findGameWindow()) {
+                g_uiThread = GetWindowThreadProcessId(window, nullptr);
+                g_messageHook = SetWindowsHookExW(WH_GETMESSAGE, launchMessageHook,
+                                                g_module, g_uiThread);
+            }
+        }
+        if (g_messageHook && g_launchMessage &&
+            !g_sessionTickPending.exchange(true, std::memory_order_acq_rel)) {
+            if (!PostThreadMessageW(g_uiThread, g_launchMessage, 0, 0))
+                g_sessionTickPending.store(false, std::memory_order_release);
+        }
+        Sleep(10);
+    }
 }
 
 bool installHooks() {
@@ -1988,25 +2022,19 @@ DWORD WINAPI workerThread(void*) {
         InterlockedExchange(&g_launchControl->state, frostlaunch::unavailable);
     }
     g_launchMessage = RegisterWindowMessageW(L"FrostBridge.NativeLaunch.Tick.V1");
+    HANDLE sessionPump = CreateThread(nullptr, 0, sessionPumpThread, nullptr, 0, nullptr);
+    if (sessionPump) CloseHandle(sessionPump);
+    else logLine(L"Could not start session synchronization pump.");
 
     // The panels can already be open when the DLL is injected. Hooks handle all
     // later updates; this worker supplies a persistent attach-time fallback.
     logLine(L"Waiting for Frostpunk main-menu panels.");
     ULONGLONG nextMaintenance = 0;
     for (;;) {
-        if (!g_messageHook) {
-            if (HWND window = findGameWindow()) {
-                g_uiThread = GetWindowThreadProcessId(window, nullptr);
-                g_messageHook = SetWindowsHookExW(WH_GETMESSAGE, launchMessageHook, g_module, g_uiThread);
-            }
-        }
-        if (g_messageHook && g_launchMessage) PostThreadMessageW(g_uiThread, g_launchMessage, 0, 0);
         if (GetTickCount64() < nextMaintenance) { Sleep(10); continue; }
         nextMaintenance = GetTickCount64() + 250;
-        // Some fullscreen SDL configurations coalesce or suppress popup-window
-        // timers. Drive both overlay windows from this persistent fallback too.
-        if (g_overlayButtonWindow) PostMessageW(g_overlayButtonWindow, WM_TIMER, 1, 0);
-        if (g_overlayWindow) PostMessageW(g_overlayWindow, WM_TIMER, 1, 0);
+        // Overlay timers run on their own UI thread; scanning a missing menu
+        // panel must never delay the in-city Multiplayer button.
         if (!g_lastConfiguredPanel.load(std::memory_order_acquire)) {
             if (void* panel = locateLivePanel(kMainMenuVtableRva,
                                               kMultiplayerButtonOffset)) {
