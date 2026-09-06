@@ -37,7 +37,6 @@ Steam AppID 480 is used for the test transport.
 
 For the complete player guide, see [`docs/PLAYER-GUIDE.md`](docs/PLAYER-GUIDE.md).
 For the downloaded package, see [`packaging/README.txt`](packaging/README.txt).
-Same-PC Sandboxie-Plus helpers are in [`sandboxie/`](sandboxie/).
 
 ## Development
 

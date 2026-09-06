@@ -4,3 +4,6 @@ dist/
 *.obj
 *.dmp
 *.log
+
+# Local-only same-PC Sandboxie test helpers; excluded from public releases.
+sandboxie/

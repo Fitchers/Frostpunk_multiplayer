@@ -39,13 +39,6 @@ survival_multiplayer. The same name is used for every connected player. To
 continue later, start both games, connect again and load the matching
 multiplayer save through CHAT/SAVE.
 
-Same-PC testing with Sandboxie-Plus
------------------------------------
-Use two different Steam accounts. Start Steam and Frostpunk in the persistent
-Sandboxie box, then connect to the normal Steam session. The test helpers are
-in the repository's sandboxie folder; they keep the game files in place and
-store the second Steam profile in a separate sandbox.
-
 Current limits
 --------------
 - Two players are supported in this community build.

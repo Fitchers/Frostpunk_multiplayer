@@ -28,12 +28,6 @@ If the host enters `survival`, the synchronized file is named
 `survival_multiplayer`. Every player must have the matching save available when
 continuing the session.
 
-## Same-PC testing
-
-Use two different Steam accounts. The repository includes `sandboxie/` helpers
-for Sandboxie-Plus. The second Steam profile is stored persistently in its own
-sandbox; the Frostpunk installation itself is reused from its normal location.
-
 ## Compatibility
 
 The supported executable is Frostpunk 1.6.1 with SHA-256
