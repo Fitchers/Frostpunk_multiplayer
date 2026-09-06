@@ -1,29 +1,62 @@
-FROSTPUNK MULTIPLAYER — TEST BUILD
+🚨 FROSTPUNK MULTIPLAYER — STEAM P2P COMMUNITY TEST 🚨
 
-1. Extract this entire folder. Keep all files together.
-2. Start Steam and sign in.
-3. Run FrostpunkMultiplayerLauncher.exe. It starts ONE game, or attaches to
-   your already running Frostpunk. If needed, select your Frostpunk.exe once.
-4. Both players open Multiplayer > Steam, enter each other's SteamID64 and
-   click Connect. The player who clicks Connect first becomes the host;
-   the selected role is shown explicitly in the connection panel.
-5. The host chooses Endless or Story Scenario, then selects a map in game.
-   Each player controls their own city. Use the Multiplayer resource panel
-   after loading. The connection panel's Minimize button keeps the session.
-6. For a direct LAN connection select LAN and enter the host's IPv4 address.
+Turn Frostpunk into a shared survival experience: every player controls an
+independent city, while the host controls the map, difficulty and start.
 
-The connection panel appears over the game; networking runs in a background
-helper that exits with the game. Do not run the helper manually.
-No PowerShell installation or two-instance test launcher is required.
+THIS IS A TEST BUILD
 
-Current limitations:
-- Two players. Steam uses test AppID 480; cross-account testing is still needed.
-- Only the verified Frostpunk 1.6.1 executable is supported. The launcher checks
-  SHA-256: 719c6e016bcdb1021a6401b1624aebdcfb03c6782a763d2fbd8c2805f9dae9d4.
-  Other executables, including other store builds, need separate verification.
-- Weather timelines are not synchronized yet.
-- Story launch and the new connection panel need end-to-end testing.
-- Use the same player name when resuming a multiplayer checkpoint.
+Requirements
+------------
+- Windows 10/11 64-bit.
+- Frostpunk 1.6.1 with SHA-256
+  719c6e016bcdb1021a6401b1624aebdcfb03c6782a763d2fbd8c2805f9dae9d4.
+- Steam installed and online.
+- One different Steam account per player. AppID 480 is used automatically.
+- Every player owns and installs Frostpunk separately.
 
-This package contains the mod, not Frostpunk. Every player needs their own game.
-This is a test package for friends, not a verified production release.
+Install
+-------
+1. Extract this entire folder. Keep the EXE and DLL files together.
+2. Do not copy these files into the Frostpunk folder.
+3. Run FrostpunkMultiplayerLauncher.exe. It starts Frostpunk and loads the mod.
+   If Frostpunk is already open, it attaches to that process.
+
+Start a Steam P2P game
+----------------------
+1. Both players open Multiplayer in the Frostpunk main menu and select Steam.
+2. Each player enters the other player's 17-digit SteamID64.
+3. Both click Connect. The first player to click Connect becomes the host.
+4. The host chooses Endless or Story Scenario, selects the map and difficulty,
+   then starts the game.
+5. The client receives the same map and difficulty and starts automatically.
+6. Each player controls their own city. Open TRADE for resource transfers and
+   CHAT/SAVE for chat and synchronized saves.
+
+Saving and continuing
+---------------------
+The host types a save name such as survival. The multiplayer save is stored as
+survival_multiplayer. The same name is used for every connected player. To
+continue later, start both games, connect again and load the matching
+multiplayer save through CHAT/SAVE.
+
+Same-PC testing with Sandboxie-Plus
+-----------------------------------
+Use two different Steam accounts. Start Steam and Frostpunk in the persistent
+Sandboxie box, then connect to the normal Steam session. The test helpers are
+in the repository's sandboxie folder; they keep the game files in place and
+store the second Steam profile in a separate sandbox.
+
+Current limits
+--------------
+- Two players are supported in this community build.
+- The supported Frostpunk executable is the exact build listed above.
+- The project is a mod and does not include Frostpunk or Steam files.
+- The current build is for testing with friends; expect bugs and report them
+  in the Discord channel.
+
+Troubleshooting
+---------------
+- If the launcher rejects Frostpunk, verify the executable version and hash.
+- If Steam P2P cannot connect, confirm both accounts are online and that the
+  two SteamID64 values were entered correctly.
+- Restart both game processes after replacing the mod files.

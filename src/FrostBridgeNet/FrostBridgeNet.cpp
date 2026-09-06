@@ -35,7 +35,7 @@
 namespace {
 
 constexpr std::uint32_t kProtocolMagic = 0x31504246;  // "FBP1"
-constexpr std::uint16_t kProtocolVersion = 15;
+constexpr std::uint16_t kProtocolVersion = 16;
 constexpr int kChannel = 17;
 constexpr int kSendUnreliable = 0;
 constexpr int kSendReliable = 2;
@@ -87,6 +87,7 @@ struct StartPayload {
     std::uint32_t request = 0;
     std::int32_t status = 0;
     std::int32_t mapIndex = -1;
+    frostlaunch::Difficulty difficulty{};
 };
 
 struct TransferRequestPayload {
@@ -1101,7 +1102,7 @@ private:
         LONG applySequence = 0;
     } incomingTransfer_;
 
-    struct LaunchState { LONG state = frostlaunch::unavailable; LONG mapIndex = -1; };
+    struct LaunchState { LONG state = frostlaunch::unavailable; LONG mapIndex = -1; frostlaunch::Difficulty difficulty{}; };
     LaunchState localLaunch() {
         if (!frostpunkProcessId_) return {};
         WinHandle mapping(OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE,
@@ -1115,6 +1116,7 @@ private:
             control->layoutVersion == frostlaunch::version) {
             result.state = InterlockedCompareExchange(&control->state, 0, 0);
             result.mapIndex = InterlockedCompareExchange(&control->mapIndex, 0, 0);
+            if (result.state == frostlaunch::prepared) result.difficulty = control->difficulty;
         }
         UnmapViewOfFile(control);
         return result;
@@ -1132,6 +1134,7 @@ private:
         if (control->signature == frostlaunch::magic &&
             control->layoutVersion == frostlaunch::version) {
             control->mapIndex = mapIndex;
+            control->difficulty = selectedDifficulty_;
             MemoryBarrier();
             state = InterlockedCompareExchange(&control->state,
                 frostlaunch::prepareRequested, frostlaunch::ready);
@@ -1177,16 +1180,16 @@ private:
 
     void resourceLine(const std::string& name, const CitySnapshotPayload& city) {
         std::ostringstream text;
-        text << name << ": ресурсы: уголь " << city.coal << "; древесина " << city.wood
-             << "; сталь " << city.steel << "; паровые ядра " << city.steamCores
-             << "; сырая еда " << city.rawFood << "; пищевые пайки " << city.foodRations;
+        text << name << ": resources: coal " << city.coal << "; wood " << city.wood
+             << "; steel " << city.steel << "; steam cores " << city.steamCores
+             << "; raw food " << city.rawFood << "; food rations " << city.foodRations;
         print(text.str());
     }
 
     static const char* resourceName(LONG resource) {
         constexpr const char* names[] = {
-            "угля", "древесины", "стали", "паровых ядер", "сырой еды", "пищевых пайков"};
-        return frostoverlay::validResource(resource) ? names[resource] : "неизвестного ресурса";
+            "coal", "wood", "steel", "steam cores", "raw food", "food rations"};
+        return frostoverlay::validResource(resource) ? names[resource] : "unknown resource";
     }
 
     static LONG cityAmount(const CitySnapshotPayload& city, LONG resource) {
@@ -1200,28 +1203,28 @@ private:
     }
 
     void beginOverlayTransfer(LONG resource, LONG amount) {
-        if(saves_ && saves_->active()) { overlay_.notify("Дождитесь окончания сохранения или загрузки."); return; }
+        if(saves_ && saves_->active()) { overlay_.notify("Wait for the save or load operation to finish."); return; }
         if (!connected_ || outgoingTransfer_.stage != TransferStage::none ||
             incomingTransfer_.active) {
-            overlay_.notify("Передача уже выполняется или соединение отсутствует.");
+            overlay_.notify("A transfer is already in progress or the connection is unavailable.");
             return;
         }
         if (!frostoverlay::validResource(resource) || !frostoverlay::validAmount(amount)) {
-            overlay_.notify("Отклонена некорректная команда передачи.");
+            overlay_.notify("Invalid transfer request rejected.");
             return;
         }
         if (!lastLocalCity_ || cityAmount(*lastLocalCity_, resource) < amount) {
-            overlay_.notify(std::string("Недостаточно ") + resourceName(resource) + " для передачи.");
+            overlay_.notify(std::string("Not enough ") + resourceName(resource) + " to transfer.");
             return;
         }
         const LONG applySequence = overlay_.apply(resource, -amount);
         if (!applySequence) {
-            overlay_.notify("Игровой мод не готов изменить ресурс.");
+            overlay_.notify("The game mod is not ready to change this resource.");
             return;
         }
         outgoingTransfer_ = {TransferStage::debit, ++nextTransferId_, resource,
             amount, applySequence, 0, 0, std::chrono::steady_clock::now() + std::chrono::seconds(5)};
-        overlay_.notify(("Передача " + std::to_string(amount) + " ") + resourceName(resource) + "…");
+        overlay_.notify(("Transferring " + std::to_string(amount) + " ") + resourceName(resource) + "…");
         overlay_.busy(true);
     }
 
@@ -1251,7 +1254,7 @@ private:
         if (outgoingTransfer_.stage != TransferStage::awaitingPeer ||
             result.id != outgoingTransfer_.id) return;
         if (result.status == 1 && result.applied == outgoingTransfer_.amount) {
-            const std::string message = "Вы отправили " + peerName_ + " " + std::to_string(outgoingTransfer_.amount) + " " +
+            const std::string message = "You sent " + peerName_ + " " + std::to_string(outgoingTransfer_.amount) + " " +
                 std::string(resourceName(outgoingTransfer_.resource)) + ".";
             print("[trade] " + message);
             overlay_.notify(message, true);
@@ -1302,14 +1305,14 @@ private:
                             outgoingTransfer_.resource, outgoingTransfer_.refundAmount);
                         outgoingTransfer_.stage = TransferStage::refund;
                     } else {
-                        overlay_.notify(std::string("Недостаточно ") +
-                            resourceName(outgoingTransfer_.resource) + " для передачи.");
+                        overlay_.notify(std::string("Not enough ") +
+                            resourceName(outgoingTransfer_.resource) + " to transfer.");
                         overlay_.busy(false);
                         outgoingTransfer_ = {};
                     }
                 }
             } else if (now > outgoingTransfer_.deadline) {
-                overlay_.notify("Игра не подтвердила списание ресурса.");
+                overlay_.notify("The game did not confirm the resource deduction.");
                 overlay_.busy(false);
                 outgoingTransfer_ = {};
             }
@@ -1323,7 +1326,7 @@ private:
             } else {
                 // Do not refund an ambiguous acknowledged-over-the-network credit;
                 // that could duplicate resources. The repeated ID is safe to retry later.
-                overlay_.notify("Нет подтверждения передачи; автоматический возврат небезопасен.");
+                overlay_.notify("Transfer was not confirmed; automatic rollback is unsafe.");
                 print("[trade] confirmation timeout; local debit kept to prevent duplication.");
                 overlay_.busy(false);
                 outgoingTransfer_ = {};
@@ -1331,12 +1334,12 @@ private:
         } else if (outgoingTransfer_.stage == TransferStage::refund) {
             if (const auto applied = overlay_.applied(outgoingTransfer_.applySequence)) {
                 overlay_.notify(*applied == outgoingTransfer_.refundAmount
-                    ? "Непринятый ресурс возвращён отправителю."
-                    : "Ошибка возврата ресурса; проверьте город.");
+                    ? "The unaccepted resource was returned to the sender."
+                    : "Resource rollback failed; check your city.");
                 overlay_.busy(false);
                 outgoingTransfer_ = {};
             } else if (now > outgoingTransfer_.deadline) {
-                overlay_.notify("Игра не подтвердила возврат ресурса.");
+                overlay_.notify("The game did not confirm the resource rollback.");
                 overlay_.busy(false);
                 outgoingTransfer_ = {};
             }
@@ -1348,9 +1351,9 @@ private:
                 lastIncomingResult_ = {incomingTransfer_.request.id, success ? 1 : -1, *applied};
                 sendTransferResult(lastIncomingResult_);
                 if (success) {
-                    const std::string message = "Получено " + std::to_string(incomingTransfer_.request.amount) + " " +
+                    const std::string message = "Received " + std::to_string(incomingTransfer_.request.amount) + " " +
                         std::string(resourceName(incomingTransfer_.request.resource)) +
-                        " от игрока " + peerName_ + ".";
+                        " from " + peerName_ + ".";
                     print("[trade] " + message);
                     overlay_.notify(message, true);
                 }
@@ -1403,8 +1406,8 @@ private:
         } else if (!(startCommitted_ && !sessionBarrierReleased_ && !paused)) {
             gameSession_.commandPause(paused || peerPauseRequested_ || clockHold_ || (saves_ && saves_->active()));
         }
-        print(paused ? "[sync] второй игрок поставил общую паузу."
-                     : "[sync] второй игрок снял общую паузу.");
+        print(paused ? "[sync] The other player enabled the shared pause."
+                     : "[sync] The other player disabled the shared pause.");
     }
 
     void receiveSessionState(const SessionStatePayload& state) {
@@ -1446,12 +1449,12 @@ private:
         if (const auto pause = gameSession_.localPauseEvent()) {
             if (startCommitted_ && !sessionBarrierReleased_ && !*pause) {
                 gameSession_.commandPause(true);
-                print("[sync] стартовая пауза останется до загрузки второго города.");
+                print("[sync] Startup pause remains active until the other city loads.");
             }
             if (connected_) {
                 sendPause(*pause);
-                print(*pause ? "[sync] общая пауза включена."
-                             : "[sync] общая пауза снята.");
+                print(*pause ? "[sync] Shared pause enabled."
+                             : "[sync] Shared pause disabled.");
             }
         }
 
@@ -1472,10 +1475,10 @@ private:
                 // Frame-sized corrections are normal; do not flood the chat.
                 if (hold && (waiting || localState.gameTimeMs - peerSession_->gameTimeMs > 60000) &&
                     !clockWaitReported_) {
-                    print("[sync] город ожидает выравнивания игрового времени.");
+                    print("[sync] City is waiting for game-time alignment.");
                     clockWaitReported_ = true;
                 } else if (!hold && clockWaitReported_) {
-                    print("[sync] время выровнено; город продолжает работу.");
+                    print("[sync] Game time aligned; the city is resuming.");
                     clockWaitReported_ = false;
                 }
             }
@@ -1491,7 +1494,7 @@ private:
 
     void sendStart(MessageType type, std::uint32_t request, LONG state, LONG mapIndex = -1) {
         sendPacket(makePacket(type, ++sequence_, local_,
-                              StartPayload{request, state, mapIndex}), true);
+                              StartPayload{request, state, mapIndex, selectedDifficulty_}), true);
     }
 
     void commitLocalPreparedMap() {
@@ -1504,8 +1507,8 @@ private:
         waitingStart_ = false;
         launchDeadline_ = std::chrono::steady_clock::now() + std::chrono::seconds(90);
         print(state == frostlaunch::commitRequested
-            ? "[game] launching: синхронно запускается выбранная карта…"
-            : "[game] failed: игра не готова к запуску. Вернитесь в меню подключения.");
+            ? "[game] launching: starting the selected map for both players…"
+            : "[game] failed: the game is not ready to start. Return to the connection menu.");
         if (state != frostlaunch::commitRequested) {
             launchReported_ = true;
             sendStart(MessageType::startResult, startRequest_, frostlaunch::failed);
@@ -1518,6 +1521,7 @@ private:
         waitingStart_=prepared_=hostMapPreparing_=waitingClientMap_=false;
         clientMapPreparing_=clientMapPrepared_=false;
         selectedMapIndex_=-1;
+        selectedDifficulty_ = {};
         resetLocalLaunch();
         print(std::string("[game] rejected: ")+reason);
     }
@@ -1534,21 +1538,26 @@ private:
         } else if (type == MessageType::startReady && host_ && waitingStart_ && start.request == startRequest_) {
             waitingStart_ = false;
             if (start.status != frostlaunch::ready || localLaunch().state != frostlaunch::ready) {
-                print("[game] rejected: оба игрока должны находиться в меню подключения с обновлённым модом.");
+                print("[game] rejected: both players must be in the connection menu with the current mod.");
                 return;
             }
             const LONG state = requestLocalPrepare(selectedMapIndex_);
             if (state != frostlaunch::prepareRequested) {
-                print("[game] rejected: хост не смог открыть выбор карты.");
+                print("[game] rejected: the host could not open map selection.");
                 return;
             }
             hostMapPreparing_ = true;
             launchDeadline_ = std::chrono::steady_clock::now() + std::chrono::minutes(10);
-            print("[game] host-map: хост подготавливает карту и её точный индекс.");
+            print("[game] host-map: the host is preparing the map and its exact index.");
         } else if (type == MessageType::startCommit && !host_ && prepared_ &&
                    !startCommitted_ && start.request == startRequest_ &&
                    std::chrono::steady_clock::now() < launchDeadline_) {
             prepared_ = false;
+            if (!start.difficulty.valid()) {
+                abortMapSelection("invalid host difficulty settings.", true);
+                return;
+            }
+            selectedDifficulty_ = start.difficulty;
             selectedMapIndex_ = start.mapIndex;
             const LONG state = requestLocalPrepare(selectedMapIndex_);
             clientMapPreparing_ = state == frostlaunch::prepareRequested;
@@ -1557,13 +1566,14 @@ private:
                 sendStart(MessageType::startResult, startRequest_, frostlaunch::failed,
                           selectedMapIndex_);
         } else if (type == MessageType::startGo && !host_ && clientMapPrepared_ &&
-                   start.request == startRequest_ && start.mapIndex == selectedMapIndex_) {
+                   start.request == startRequest_ && start.mapIndex == selectedMapIndex_ &&
+                   start.difficulty == selectedDifficulty_) {
             commitLocalPreparedMap();
         } else if (type == MessageType::startResult && host_ && waitingClientMap_ &&
                    start.request == startRequest_ && start.status == frostlaunch::prepared) {
             waitingClientMap_ = false;
-            if (start.mapIndex != selectedMapIndex_) {
-                print("[game] rejected: клиент подготовил другую карту.");
+            if (start.mapIndex != selectedMapIndex_ || !(start.difficulty == selectedDifficulty_)) {
+                abortMapSelection("the client prepared different map or difficulty settings.", true);
                 return;
             }
             sendStart(MessageType::startGo, startRequest_, frostlaunch::commitRequested,
@@ -1571,10 +1581,10 @@ private:
             commitLocalPreparedMap();
         } else if (type == MessageType::startResult && start.request == startRequest_ &&
                    start.status == frostlaunch::dispatched) {
-            print("[game] peer-loading: второй игрок запустил ту же карту.");
+            print("[game] peer-loading: the other player started the same map.");
         } else if (type == MessageType::startResult && start.request == startRequest_ &&
                    start.status == frostlaunch::failed) {
-            abortMapSelection("второй игрок отменил выбор карты или не смог её подготовить.",false);
+            abortMapSelection("the other player cancelled map selection or could not prepare it.",false);
         }
     }
 
@@ -1585,27 +1595,36 @@ private:
                 hostMapPreparing_ = false;
                 waitingClientMap_ = true;
                 selectedMapIndex_ = launch.mapIndex;
+                selectedDifficulty_ = launch.difficulty;
+                if (!selectedDifficulty_.valid()) {
+                    abortMapSelection("could not read the host difficulty settings.", true);
+                    return;
+                }
                 sendStart(MessageType::startCommit, startRequest_, frostlaunch::prepared,
                           selectedMapIndex_);
                 launchDeadline_ = now + std::chrono::seconds(30);
-                print("[game] host-map: индекс карты передан клиенту; ожидается подтверждение.");
+                print("[game] host-map: map index sent to the client; waiting for confirmation.");
             } else if (launch.state == frostlaunch::failed || now > launchDeadline_) {
-                abortMapSelection("выбор карты отменён; можно выбрать другой режим.",true);
+                abortMapSelection("map selection cancelled; you can choose another mode.",true);
             }
         }
         if (clientMapPreparing_) {
             if (launch.state == frostlaunch::prepared) {
                 clientMapPreparing_ = false;
+                if (!(launch.difficulty == selectedDifficulty_)) {
+                    abortMapSelection("client difficulty verification failed.", true);
+                    return;
+                }
                 clientMapPrepared_ = true;
                 sendStart(MessageType::startResult, startRequest_, frostlaunch::prepared,
                           launch.mapIndex);
-                print("[game] client-map: карта хоста подготовлена; ожидается общий старт.");
+                print("[game] client-map: the host map is ready; waiting for the shared start.");
             } else if (launch.state == frostlaunch::failed || now > launchDeadline_) {
-                abortMapSelection("карта хоста отменена или недоступна.",true);
+                abortMapSelection("the host map was cancelled or is unavailable.",true);
             }
         }
         if (waitingClientMap_ && now > launchDeadline_) {
-            abortMapSelection("клиент не подтвердил карту за 30 секунд.",true);
+            abortMapSelection("the client did not confirm the map within 30 seconds.",true);
         }
     }
 
@@ -1645,11 +1664,11 @@ private:
         if (line == "start" || line == "start story") {
             if(saves_ && saves_->active()) { print("[save] Wait for the checkpoint operation."); return; }
             if (!host_ || !connected_ || startCommitted_ || waitingStart_) {
-                print("[game] rejected: запуск доступен только подключённому хосту, один раз за сессию.");
+                print("[game] rejected: only the connected host can start, once per session.");
                 return;
             }
             if (localLaunch().state != frostlaunch::ready) {
-                print("[game] rejected: откройте меню подключения в игре; необходим обновлённый мод.");
+                print("[game] rejected: open the in-game connection menu; the current mod is required.");
                 return;
             }
             ++startRequest_;
@@ -1659,7 +1678,7 @@ private:
             waitingStart_ = true;
             launchDeadline_ = std::chrono::steady_clock::now() + std::chrono::seconds(10);
             sendStart(MessageType::startPrepare, startRequest_, 0);
-            print("[game] preparing: проверяю готовность обоих игроков…");
+            print("[game] preparing: checking both players…");
             return;
         }
         if (line == "hello") {
@@ -1828,15 +1847,15 @@ private:
             if(saves_) saves_->poll();
             if (waitingStart_ && now > launchDeadline_) {
                 waitingStart_ = false;
-                print("[game] rejected: второй игрок не подтвердил готовность за 10 секунд.");
+                print("[game] rejected: the other player did not confirm readiness within 10 seconds.");
             }
             if (startCommitted_ && !launchReported_) {
                 const LONG state = localLaunch().state;
                 if (state == frostlaunch::dispatched || state == frostlaunch::failed || now > launchDeadline_) {
                     launchReported_ = true;
                     const bool ok = state == frostlaunch::dispatched;
-                    print(ok ? "[game] loading: команда запуска передана игре; ожидаем ресурсы города."
-                             : "[game] failed: автозапуск не завершился. Проверьте окно игры и FrostMenuMod.log.");
+                    print(ok ? "[game] loading: start command delivered; waiting for city resources."
+                             : "[game] failed: automatic start did not complete. Check the game and FrostMenuMod.log.");
                     sendStart(MessageType::startResult, startRequest_, ok ? frostlaunch::dispatched : frostlaunch::failed);
                 }
             }
@@ -1895,6 +1914,7 @@ private:
     bool startCommitted_ = false, launchReported_ = false;
     std::uint32_t startRequest_ = 0;
     LONG selectedMapIndex_ = -1;
+    frostlaunch::Difficulty selectedDifficulty_{};
     std::chrono::steady_clock::time_point launchDeadline_{};
     std::string peerName_;
     std::optional<CitySnapshotPayload> lastLocalCity_;

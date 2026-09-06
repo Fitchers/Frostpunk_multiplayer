@@ -1,0 +1,30 @@
+<Configuration>
+  <VGpu>Enable</VGpu>
+  <Networking>Enable</Networking>
+  <MemoryInMB>12288</MemoryInMB>
+  <MappedFolders>
+    <MappedFolder>
+      <HostFolder>D:\Frostpunk</HostFolder>
+      <SandboxFolder>C:\Frostpunk</SandboxFolder>
+      <ReadOnly>true</ReadOnly>
+    </MappedFolder>
+    <MappedFolder>
+      <HostFolder>C:\Users\serge\Desktop\My work\Frostpunk-RE-Lab</HostFolder>
+      <SandboxFolder>C:\FrostSource</SandboxFolder>
+      <ReadOnly>true</ReadOnly>
+    </MappedFolder>
+    <MappedFolder>
+      <HostFolder>C:\FrostpunkSandboxData</HostFolder>
+      <SandboxFolder>C:\Persistent</SandboxFolder>
+      <ReadOnly>false</ReadOnly>
+    </MappedFolder>
+    <MappedFolder>
+      <HostFolder>C:\FrostpunkSandboxSaves</HostFolder>
+      <SandboxFolder>C:\Users\WDAGUtilityAccount\AppData\Roaming\11bitstudios\Frostpunk\Default\saves</SandboxFolder>
+      <ReadOnly>false</ReadOnly>
+    </MappedFolder>
+  </MappedFolders>
+  <LogonCommand>
+    <Command>powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\FrostSource\sandbox\Start-Sandbox.ps1</Command>
+  </LogonCommand>
+</Configuration>

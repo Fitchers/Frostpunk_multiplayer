@@ -103,7 +103,7 @@ std::filesystem::path configuredGamePath() {
     dialog.lpstrFilter = L"Frostpunk.exe\0Frostpunk.exe\0\0";
     dialog.lpstrFile = savedPath;
     dialog.nMaxFile = 32768;
-    dialog.lpstrTitle = L"Выберите установленный Frostpunk.exe";
+    dialog.lpstrTitle = L"Select the installed Frostpunk.exe";
     dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
     if (!GetOpenFileNameW(&dialog)) fail("Game selection cancelled.");
     WritePrivateProfileStringW(L"Game", L"Path", savedPath, config.c_str());

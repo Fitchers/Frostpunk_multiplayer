@@ -85,8 +85,8 @@ int main() {
         control.localHope=4000; control.peerHope=4000;
         control.localDiscontent=81; control.peerDiscontent=1785;
         control.localState=3; control.peerState=2; control.skewSeconds=-2;
-        wcscpy_s(control.history[0],L"Вы отправили User 20 древесины.");
-        wcscpy_s(control.history[1],L"Получено 10 угля от игрока User.");
+        wcscpy_s(control.history[0],L"You sent User 20 wood.");
+        wcscpy_s(control.history[1],L"Received 10 coal from User.");
         selectOverlayResource(window,1);
         check((GetWindowLongW(g_amountSliders[1],GWL_STYLE)&WS_VISIBLE)!=0,"Selected slider hidden");
         check((GetWindowLongW(g_amountSliders[0],GWL_STYLE)&WS_VISIBLE)==0,"Other slider visible");

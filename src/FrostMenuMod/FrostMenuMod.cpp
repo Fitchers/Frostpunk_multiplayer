@@ -129,7 +129,7 @@ MenuPanelCallback g_originalMenuPanelCallback = nullptr;
 ScenariosPanelUpdate g_originalScenariosPanelUpdate = nullptr;
 ScenariosStartCallback g_originalScenariosStartCallback = nullptr;
 MenuPanelCallback g_originalScenarioRowCallback = nullptr;
-std::atomic<int> g_selectedConnection = -1; // 0 Steam, 1 LAN; not a scenario id.
+std::atomic<int> g_selectedConnection = -1; // 0 Steam; not a scenario id.
 std::atomic<void*> g_lastConfiguredPanel = nullptr;
 std::atomic<void*> g_connectionPanel = nullptr;
 std::atomic_flag g_applyLock = ATOMIC_FLAG_INIT;
@@ -364,7 +364,7 @@ bool configureMenuPanel(void* panel) {
                 const bool summarySet = setText(summary, kSummary);
                 if (titleSet) {
                     // Endless' localized caption is substantially wider than
-                    // "МУЛЬТИПЛЕЕР". On the first frame Liquid keeps the old
+                    // The localized "MULTIPLAYER" title. On the first frame Liquid keeps the old
                     // left edge and centers it only after a later panel reopen.
                     // Correct the text anchor once; the stock button container
                     // and its hit box are never moved.
@@ -502,19 +502,11 @@ bool configureConnectionPanel(void* panel) {
             const auto setVisibility =
                 reinterpret_cast<SetVisibility>(g_gameBase + kSetVisibilityRva);
 
-            // The Russian build converts narrow strings as Windows-1251.
-            constexpr char kConnectionHeader[] =
-                "\xC2\xDB\xC1\xD0\xC0\xD2\xDC "
-                "\xCF\xCE\xC4\xCA\xCB\xDE\xD7\xC5\xCD\xC8\xC5";
+            // ASCII remains stable when the localized build converts narrow text.
+            constexpr char kConnectionHeader[] = "SELECT CONNECTION";
             constexpr char kSteamTitle[] = "STEAM";
             constexpr char kSteamSummary[] = "STEAM P2P";
-            constexpr char kLanTitle[] =
-                "\xCB\xCE\xCA\xC0\xCB\xDC\xCD\xC0\xDF "
-                "\xD1\xC5\xD2\xDC";
-            constexpr char kLanSummary[] =
-                "\xCF\xD0\xDF\xCC\xCE\xC5 P2P \xCF\xCE IP";
-            constexpr char kSelectTitle[] =
-                "\xC2\xDB\xC1\xD0\xC0\xD2\xDC";
+            constexpr char kSelectTitle[] = "SELECT";
 
             if (void* headerLayout = findElement(root, "HEADER_LAYOUT")) {
                 setText(findText(headerLayout, "TEXT"), kConnectionHeader);
@@ -535,27 +527,10 @@ bool configureConnectionPanel(void* panel) {
             }
 
             // SCENARIO_SELECTION_LAYOUT alternates wrappers and dotted separators.
-            // Reuse the first two scenario rows for Steam and direct LAN P2P.
+            // Steam is the only player-facing transport. Direct LAN remains
+            // available only to automated development tests.
             void* firstSeparator = nextSibling(firstWrapper);
-            void* lanWrapper = nextSibling(firstSeparator);
-            if (firstSeparator) setVisibility(firstSeparator, true, true, false);
-            if (lanWrapper) {
-                setVisibility(lanWrapper, true, true, false);
-                configureConnectionButton(panel, lanWrapper, 1);
-                setText(findText(lanWrapper, "TITLE_TEXT"), kLanTitle);
-                if (void* summary = findText(lanWrapper, "MAIN_STORY_TEXT")) {
-                    setText(summary, kLanSummary);
-                    setVisibility(summary, true, true, false);
-                }
-                if (void* disabled = findElement(lanWrapper, "DISABLED_TEXT")) {
-                    setVisibility(disabled, false, true, false);
-                }
-                if (void* unlock = findElement(lanWrapper, "UNLOCK_SCENARIO_TEXT")) {
-                    setVisibility(unlock, false, true, false);
-                }
-            }
-
-            void* item = lanWrapper ? nextSibling(lanWrapper) : firstSeparator;
+            void* item = firstSeparator;
             for (int index = 0; item && index < 32; ++index) {
                 void* following = nextSibling(item);
                 setVisibility(item, false, true, false);
@@ -571,7 +546,7 @@ bool configureConnectionPanel(void* panel) {
             }
 
             if (g_connectionPanel.exchange(panel, std::memory_order_acq_rel) != panel) {
-                logLine(L"Connection selection panel configured with Steam and LAN P2P.");
+                logLine(L"Connection selection panel configured with Steam P2P.");
                 if (!steamBound) logLine(L"SCENARIO_BUTTON type check failed; connection input not bound.");
             }
             configured = true;
@@ -911,7 +886,7 @@ std::wstring utf8Name(const char* input, const wchar_t* fallback) {
 }
 
 void overlayNames(std::wstring& local, std::wstring& peer) {
-    if (!g_overlayControl) { local = L"Вы"; peer = L"Игрок 2"; return; }
+    if (!g_overlayControl) { local = L"You"; peer = L"Player 2"; return; }
     char localBytes[64]{}, peerBytes[64]{};
     for (int attempt = 0; attempt < 4; ++attempt) {
         const LONG before = InterlockedCompareExchange(
@@ -924,8 +899,8 @@ void overlayNames(std::wstring& local, std::wstring& peer) {
         if (before == InterlockedCompareExchange(&g_overlayControl->namesSequence, 0, 0)) break;
     }
     localBytes[63] = peerBytes[63] = '\0';
-    local = utf8Name(localBytes, L"Вы");
-    peer = utf8Name(peerBytes, L"Игрок 2");
+    local = utf8Name(localBytes, L"You");
+    peer = utf8Name(peerBytes, L"Player 2");
 }
 
 LONG selectedAmount(LONG resource) {
@@ -998,7 +973,7 @@ constexpr int overlayWidth = 760, overlayHeight = 604;
 int g_selectedResource = 0;
 RECT g_quickButtons[4]{};
 constexpr const wchar_t* resourceLabels[] = {
-    L"Уголь", L"Древесина", L"Сталь", L"Паровые ядра", L"Сырая еда", L"Пайки"};
+    L"Coal", L"Wood", L"Steel", L"Steam Cores", L"Raw Food", L"Food Rations"};
 
 void selectOverlayResource(HWND window, int resource) {
     g_selectedResource = resource;
@@ -1050,7 +1025,7 @@ void resourceIcon(HDC dc, int x, int y, int resource) {
 
 void drawPlayerCard(HDC dc, int x, const std::wstring& name, LONG state,
                     LONG hope, LONG discontent) {
-    constexpr const wchar_t* states[]{L"нет данных",L"загружается",L"играет",L"пауза"};
+    constexpr const wchar_t* states[]{L"no data",L"loading",L"playing",L"paused"};
     overlayText(dc,name,{x,40,x+350,64},RGB(246,197,70));
     overlayText(dc,states[std::clamp(state,0L,3L)],{x,65,x+350,85},RGB(185,198,207));
     const LONG values[]{hope,discontent};
@@ -1062,8 +1037,8 @@ void drawPlayerCard(HDC dc, int x, const std::wstring& name, LONG state,
             overlayFill(dc,fill,i ? RGB(151,49,58) : RGB(35,115,153));
         }
         wchar_t text[64]{};
-        if(values[i]<0) _snwprintf_s(text,_TRUNCATE,L"%s: —",i?L"Недов.":L"Надежда");
-        else _snwprintf_s(text,_TRUNCATE,L"%s: %.1f%%",i?L"Недов.":L"Надежда",values[i]/100.0);
+        if(values[i]<0) _snwprintf_s(text,_TRUNCATE,L"%s: —",i?L"Discontent":L"Hope");
+        else _snwprintf_s(text,_TRUNCATE,L"%s: %.1f%%",i?L"Discontent":L"Hope",values[i]/100.0);
         overlayText(dc,text,bar,RGB(240,245,247),DT_CENTER);
     }
 }
@@ -1071,9 +1046,9 @@ void drawPlayerCard(HDC dc, int x, const std::wstring& name, LONG state,
 void drawResourceTable(HDC dc, const frostoverlay::Values& local,
                         const frostoverlay::Values& peer) {
     constexpr COLORREF white=RGB(227,235,240), muted=RGB(153,170,180), gold=RGB(246,197,70);
-    overlayText(dc,L"РЕСУРС",{52,145,240,166},muted);
-    overlayText(dc,L"У тебя → У друга",{244,145,452,166},muted,DT_CENTER);
-    overlayText(dc,L"Количество",{473,145,565,166},muted,DT_CENTER);
+    overlayText(dc,L"RESOURCE",{52,145,240,166},muted);
+    overlayText(dc,L"You → Friend",{244,145,452,166},muted,DT_CENTER);
+    overlayText(dc,L"Amount",{473,145,565,166},muted,DT_CENTER);
     for(int i=0;i<6;++i) {
         int y=174+i*42;
         overlayFill(dc,{16,y-2,744,y+37},i==g_selectedResource?RGB(35,46,52):RGB(20,28,33));
@@ -1086,11 +1061,11 @@ void drawResourceTable(HDC dc, const frostoverlay::Values& local,
         g_plusButtons[i]=button;
         const bool enabled=canSend(i,local);
         overlayFill(dc,button,enabled?RGB(112,86,31):RGB(43,49,54));
-        overlayText(dc,L"Передать",button,enabled?gold:RGB(125,137,144),DT_CENTER);
+        overlayText(dc,L"SEND",button,enabled?gold:RGB(125,137,144),DT_CENTER);
     }
-    overlayText(dc,std::wstring(resourceLabels[g_selectedResource])+L" · доступно "+
+    overlayText(dc,std::wstring(resourceLabels[g_selectedResource])+L" · available "+
         std::to_wstring(local.item[g_selectedResource]),{20,432,358,455},muted);
-    const wchar_t* quick[]{L"1",L"10",L"50",L"Всё"};
+    const wchar_t* quick[]{L"1",L"10",L"50",L"ALL"};
     for(int i=0;i<4;++i) {
         g_quickButtons[i]={446+i*74,435,512+i*74,464};
         overlayFill(dc,g_quickButtons[i],RGB(47,56,61));
@@ -1241,7 +1216,7 @@ LRESULT CALLBACK overlayWindowProc(HWND window, UINT message, WPARAM wp, LPARAM 
         const HGDIOBJ oldFont = SelectObject(dc, title);
         SetTextColor(dc, RGB(246, 197, 70));
         RECT heading{12, 5, overlayWidth - 12, 30};
-        DrawTextW(dc, L"FROSTPUNK MULTIPLAYER  •  ОБМЕН РЕСУРСАМИ", -1,
+        DrawTextW(dc, L"FROSTPUNK MULTIPLAYER  •  RESOURCE TRADE", -1,
                   &heading, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
         frostoverlay::Values local{}, peer{};
         if (g_overlayControl) {
@@ -1251,17 +1226,17 @@ LRESULT CALLBACK overlayWindowProc(HWND window, UINT message, WPARAM wp, LPARAM 
         std::wstring localName, peerName;
         overlayNames(localName, peerName);
         SelectObject(dc, small);
-        drawPlayerCard(dc,20,localName+L" (вы)",g_overlayControl?g_overlayControl->localState:0,
+        drawPlayerCard(dc,20,localName+L" (you)",g_overlayControl?g_overlayControl->localState:0,
             g_overlayControl?g_overlayControl->localHope:-1,g_overlayControl?g_overlayControl->localDiscontent:-1);
         drawPlayerCard(dc,394,peerName,g_overlayControl?g_overlayControl->peerState:0,
             g_overlayControl?g_overlayControl->peerHope:-1,g_overlayControl?g_overlayControl->peerDiscontent:-1);
         const bool clocks = g_overlayControl && g_overlayControl->localState >= 2 && g_overlayControl->peerState >= 2;
         const LONG skew = g_overlayControl ? g_overlayControl->skewSeconds : 0;
-        std::wstring clockText = !clocks ? L"Разница времени: ждём данные обоих городов" :
-            L"Разница игрового времени: " + std::to_wstring(skew) + L" с (вы − друг)";
+        std::wstring clockText = !clocks ? L"Time difference: waiting for both cities" :
+            L"Game-time difference: " + std::to_wstring(skew) + L" s (you − friend)";
         overlayText(dc,clockText,{20,116,740,139},RGB(176,194,204),DT_CENTER);
         drawResourceTable(dc,local,peer);
-        overlayText(dc,L"ПОСЛЕДНИЕ ПЕРЕДАЧИ",{20,492,740,512},RGB(246,197,70));
+        overlayText(dc,L"RECENT TRANSFERS",{20,492,740,512},RGB(246,197,70));
         wchar_t history[3][160]{};
         if (g_overlayControl) {
             const LONG before=InterlockedCompareExchange(&g_overlayControl->historySequence,0,0);
@@ -1273,7 +1248,7 @@ LRESULT CALLBACK overlayWindowProc(HWND window, UINT message, WPARAM wp, LPARAM 
         }
         for(int i=0;i<3;++i) {
             history[i][159]=0;
-            overlayText(dc,history[i][0]?history[i]:(i==0?L"Пока нет передач":L""),
+            overlayText(dc,history[i][0]?history[i]:(i==0?L"No transfers yet":L""),
                 {20,514+i*20,740,534+i*20},RGB(191,204,213));
         }
 
@@ -1289,7 +1264,7 @@ LRESULT CALLBACK overlayWindowProc(HWND window, UINT message, WPARAM wp, LPARAM 
         SetTextColor(dc, RGB(184, 195, 202));
         SelectObject(dc, small);
         RECT status{20, 579, 740, 600};
-        DrawTextW(dc, notification[0] ? notification : L"Выберите ресурс для ползунка. MULTIPLAYER закрывает панель.",
+        DrawTextW(dc, notification[0] ? notification : L"Select a resource to use the slider. MULTIPLAYER closes this panel.",
                   -1, &status, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_VCENTER);
         SelectObject(dc, oldFont);
         DeleteObject(title); DeleteObject(normal); DeleteObject(small);
@@ -1468,7 +1443,7 @@ DWORD WINAPI overlayThread(void*) {
 }
 
 DWORD WINAPI showConnectionDialog(void* selected) {
-    const bool lan = reinterpret_cast<std::uintptr_t>(selected) == 1;
+    (void)selected;
     wchar_t path[32768]{};
     GetModuleFileNameW(g_module, path, 32768);
     wchar_t* separator = wcsrchr(path, L'\\');
@@ -1476,8 +1451,8 @@ DWORD WINAPI showConnectionDialog(void* selected) {
         *separator = L'\0';
         const std::wstring directory(path);
         const std::wstring executable = directory + L"\\FrostBridgeNet.exe";
-        const auto otherTitle = L"FrostBridge — " + std::wstring(lan?L"Steam":L"LAN") +
-            L" — PID " + std::to_wstring(GetCurrentProcessId());
+        const auto otherTitle = L"FrostBridge — LAN — PID " +
+            std::to_wstring(GetCurrentProcessId());
         if(HWND other=FindWindowW(L"FrostBridgeConnectionUI",otherTitle.c_str())) {
             DWORD_PTR ignored=0;
             SendMessageTimeoutW(other,kCloseForTransportSwitch,0,0,
@@ -1485,8 +1460,7 @@ DWORD WINAPI showConnectionDialog(void* selected) {
             for(int attempt=0;attempt<100 &&
                 FindWindowW(L"FrostBridgeConnectionUI",otherTitle.c_str());++attempt) Sleep(10);
         }
-        std::wstring command = L"\"" + executable + L"\" --ui --overlay " +
-            (lan ? L"--lan" : L"--steam") + L" --pid " +
+        std::wstring command = L"\"" + executable + L"\" --ui --overlay --steam --pid " +
             std::to_wstring(GetCurrentProcessId());
         STARTUPINFOW startup{};
         startup.cb = sizeof(startup);
@@ -1495,17 +1469,17 @@ DWORD WINAPI showConnectionDialog(void* selected) {
                            FALSE, CREATE_NO_WINDOW, nullptr, directory.c_str(), &startup, &process)) {
             AllowSetForegroundWindow(process.dwProcessId);
             CloseHandle(process.hThread);
-            logLine(lan ? L"LAN connection form opened." : L"Steam connection form opened.");
+            logLine(L"Steam connection form opened.");
             // Non-modal. A later click launches a short-lived instance which
             // restores the existing form through its per-city mutex.
             CloseHandle(process.hProcess);
         } else {
             const DWORD code = GetLastError();
-            const std::wstring error = L"Не удалось открыть встроенное окно FrostBridgeNet.exe. Код Windows: " +
-                std::to_wstring(code) + L".\nФайл: " + executable +
+            const std::wstring error = L"Could not open the built-in FrostBridgeNet.exe window. Windows error: " +
+                std::to_wstring(code) + L".\nFile: " + executable +
                 (code == ERROR_VIRUS_INFECTED || code == ERROR_VIRUS_DELETED
-                    ? L"\nWindows заблокировала файл. Подробности — в журнале защиты."
-                    : L"\nПроверьте комплект сборки: нужен FrostBridgeNet.exe рядом с DLL.");
+                    ? L"\nWindows blocked the file. See Protection history for details."
+                    : L"\nCheck the installation: FrostBridgeNet.exe must be next to the DLL.");
             MessageBoxW(findGameWindow(), error.c_str(), L"FrostBridge", MB_OK | MB_ICONERROR);
         }
     }
@@ -1514,11 +1488,11 @@ DWORD WINAPI showConnectionDialog(void* selected) {
 }
 
 void openConnectionForm(int index) {
-    if (index < 0 || index > 1) return;
+    if (index != 0) return;
     // A form may be behind the game or minimized. Restore it directly from
     // the input-owning game instead of requiring another confirmation click.
-    const auto title = L"FrostBridge — " + std::wstring(index?L"LAN":L"Steam") +
-        L" — PID " + std::to_wstring(GetCurrentProcessId());
+    const auto title = L"FrostBridge — Steam — PID " +
+        std::to_wstring(GetCurrentProcessId());
     if (HWND window = FindWindowW(L"FrostBridgeConnectionUI", title.c_str())) {
         ShowWindow(window, SW_RESTORE);
         SetForegroundWindow(window);
@@ -1586,19 +1560,58 @@ void __fastcall scenarioRowCallbackHook(void* owner, void* event) {
     }
     std::uint32_t index = 0;
     if (!event || !safeRead(static_cast<std::uint8_t*>(event) + 0x18, index) ||
-        index > 1) return;
-    g_selectedConnection.store(static_cast<int>(index), std::memory_order_release);
-    logLine(index == 0 ? L"Steam connection selected." : L"LAN connection selected.");
+        index != 0) return;
+    g_selectedConnection.store(0, std::memory_order_release);
+    logLine(L"Steam connection selected.");
     configureConnectionPanel(owner);
     g_openConnectionForm(static_cast<int>(index));
     // Do not call the scenario callback: it checks DLC/progression and opens
     // scenario details. These two rows represent transports, not scenarios.
 }
 
+// Native scenario ApplyDifficulty (1A78BA0) and endless Start (1A8ADE0)
+// consume these slider selections, not the text of the overall preset.
+bool readLaunchDifficulty(void* owner, bool story, frostlaunch::Difficulty& out) {
+    out = {};
+    __try {
+        auto* panel = static_cast<unsigned char*>(owner);
+        const auto offset = story ? 0x1C8 : 0x1B0;
+        auto* entries = *reinterpret_cast<unsigned char**>(panel + offset);
+        out.count = *reinterpret_cast<int*>(panel + offset + 8);
+        if (!entries || out.count < 1 || out.count > 16) return false;
+        out.survivor = story ? panel[0x1E0] : 0;
+        for (LONG i = 0; i < out.count; ++i) {
+            auto* slider = *reinterpret_cast<unsigned char**>(entries + i * 16 + 8);
+            if (!slider) return false;
+            out.levels[i] = *reinterpret_cast<int*>(slider + 0x314);
+        }
+        return out.valid();
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool applyLaunchDifficulty(void* owner, bool story) {
+    const auto expected = g_launchControl->difficulty;
+    frostlaunch::Difficulty actual{};
+    if (!expected.valid() || !readLaunchDifficulty(owner, story, actual) ||
+        actual.count != expected.count || (!story && expected.survivor)) return false;
+    __try {
+        auto* panel = static_cast<unsigned char*>(owner);
+        auto* entries = *reinterpret_cast<unsigned char**>(panel + (story ? 0x1C8 : 0x1B0));
+        // Executed on the menu thread immediately before native Start consumes
+        // the values. Never transfer process pointers or modify loaded cities.
+        for (LONG i = 0; i < expected.count; ++i) {
+            auto* slider = *reinterpret_cast<unsigned char**>(entries + i * 16 + 8);
+            *reinterpret_cast<int*>(slider + 0x314) = expected.levels[i];
+        }
+        if (story) panel[0x1E0] = static_cast<unsigned char>(expected.survivor);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    return readLaunchDifficulty(owner, story, actual) && actual == expected;
+}
+
 void __fastcall scenariosStartCallbackHook(void* owner, void* event) {
     if (g_multiplayerMode.load(std::memory_order_acquire)) {
         const int index = g_selectedConnection.load(std::memory_order_acquire);
-        if (index >= 0 && index <= 1) g_openConnectionForm(index);
+        if (index == 0) g_openConnectionForm(0);
         return;
     }
     if (g_launchControl && frostlaunch::isStory(g_launchControl->mapIndex) &&
@@ -1609,6 +1622,11 @@ void __fastcall scenariosStartCallbackHook(void* owner, void* event) {
             if (!safeRead(panel + 0x1B0, index) || !safeRead(panel + 0x1A0, count) ||
                 index < 0 || index >= count || count > 64) return;
             g_endlessConfig = owner;
+            if (!readLaunchDifficulty(owner, true, g_launchControl->difficulty)) {
+                InterlockedExchange(&g_launchControl->state, frostlaunch::failed);
+                logLine(L"Could not capture scenario difficulty; launch cancelled.");
+                return;
+            }
             g_selectedMapIndex = frostlaunch::storyBase + index;
             InterlockedExchange(&g_launchControl->mapIndex, g_selectedMapIndex);
             g_launchStage = 3;
@@ -1688,6 +1706,10 @@ void __fastcall endlessStartHook(void* panel, void* event) {
             if (!safeRead(bytes + 0x110, index) || !safeRead(bytes + 0x100, count) ||
                 index < 0 || index >= count || count > 64) return;
             g_selectedMapIndex = index;
+            if (!readLaunchDifficulty(panel, false, g_launchControl->difficulty)) {
+                InterlockedExchange(&g_launchControl->state, frostlaunch::failed);
+                return;
+            }
             InterlockedExchange(&g_launchControl->mapIndex, index);
             g_launchStage = 3;
             InterlockedExchange(&g_launchControl->state, frostlaunch::prepared);
@@ -1759,12 +1781,20 @@ void advanceEndlessLaunch() {
                 if (!safeRead(panel + 0x1B0, selected) || selected != requested ||
                     !start || !safeRead(static_cast<unsigned char*>(start) + 0x270, flags) || !(flags & 8)) return;
                 g_selectedMapIndex = g_launchControl->mapIndex;
+                if (!applyLaunchDifficulty(g_endlessConfig, true)) {
+                    InterlockedExchange(&g_launchControl->state, frostlaunch::failed);
+                    return;
+                }
                 g_launchStage = 3;
                 InterlockedExchange(&g_launchControl->state, frostlaunch::prepared);
             } else if (state == frostlaunch::commitRequested && g_launchStage == 3 && g_endlessConfig) {
                 g_launchStage = 4;
                 g_launchDeadline = GetTickCount64() + 90000;
                 // Retain the game's entitlement and progression checks.
+                if (!applyLaunchDifficulty(g_endlessConfig, true)) {
+                    InterlockedExchange(&g_launchControl->state, frostlaunch::failed);
+                    return;
+                }
                 g_originalScenariosStartCallback(g_endlessConfig, nullptr);
             } else if (state == frostlaunch::commitRequested && g_launchStage == 4 && g_sessionLoaded) {
                 InterlockedExchange(&g_launchControl->state, frostlaunch::dispatched);
@@ -1790,6 +1820,10 @@ void advanceEndlessLaunch() {
             int actual = -1;
             if (!safeRead(static_cast<unsigned char*>(g_endlessConfig) + 0x110, actual) ||
                 actual != g_selectedMapIndex) {
+                InterlockedExchange(&g_launchControl->state, frostlaunch::failed);
+                return;
+            }
+            if (!applyLaunchDifficulty(g_endlessConfig, false)) {
                 InterlockedExchange(&g_launchControl->state, frostlaunch::failed);
                 return;
             }
@@ -1872,6 +1906,10 @@ void advanceEndlessLaunch() {
                 return;
             }
             InterlockedExchange(&g_launchControl->mapIndex, g_selectedMapIndex);
+            if (!applyLaunchDifficulty(g_endlessConfig, false)) {
+                InterlockedExchange(&g_launchControl->state, frostlaunch::failed);
+                return;
+            }
             g_launchStage = 3;
             InterlockedExchange(&g_launchControl->state, frostlaunch::prepared);
             logLine(L"Endless launch: synchronized map prepared; waiting for commit.");

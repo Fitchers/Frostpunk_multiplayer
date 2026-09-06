@@ -38,7 +38,7 @@ try {
  $firstWindow=[BridgeUiTest]::FindWindowW('FrostBridgeConnectionUI',$titles[0])
  $secondWindow=[BridgeUiTest]::FindWindowW('FrostBridgeConnectionUI',$titles[1])
  Click $firstWindow 104
- if((Text-Of $firstWindow 107) -notmatch 'Введите имя') { throw 'Blank name was not rejected.' }
+ if((Text-Of $firstWindow 107) -notmatch 'Enter a player name') { throw 'Blank name was not rejected.' }
  Set-Field $firstWindow 101 'Анна "Хост"'
  Set-Field $secondWindow 101 'Гость'
  $listener=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,0)
@@ -46,7 +46,7 @@ try {
  Set-Field $firstWindow 103 "$port"
  Set-Field $secondWindow 103 '0'
  Click $secondWindow 105
- if((Text-Of $secondWindow 107) -notmatch 'Порт должен') { throw 'Invalid port was not rejected.' }
+ if((Text-Of $secondWindow 107) -notmatch 'Port must') { throw 'Invalid port was not rejected.' }
  Set-Field $secondWindow 103 "$port"
  Click $firstWindow 104
  Wait-For { (Text-Of $firstWindow 107) -match 'Hosting on port' } 'listen'
@@ -62,13 +62,13 @@ try {
  Write-Output (Text-Of $firstWindow 107)
  Write-Output (Text-Of $secondWindow 107)
  Click $firstWindow 106
- Wait-For { (Text-Of $secondWindow 108) -match 'Соединение закрыто' } 'disconnect detection'
+ Wait-For { (Text-Of $secondWindow 108) -match 'Connection closed' } 'disconnect detection'
  Click $secondWindow 106
  Click $firstWindow 104
  Start-Sleep -Milliseconds 300
  Click $firstWindow 106 # Cancel a host blocked in accept, no guest attached.
  Click $secondWindow 105 # No listener: must recover and permit retry.
- Wait-For { (Text-Of $secondWindow 108) -match 'Подключение не удалось' } 'connection refused recovery'
+ Wait-For { (Text-Of $secondWindow 108) -match 'Connection failed' } 'connection refused recovery'
  Write-Output 'PASS: required names, port validation, Unicode/quoting, two PID-bound sessions, bidirectional chat, disconnect, cancel hosting, refused connection.'
 } finally {
  foreach($window in @($firstWindow,$secondWindow)) {

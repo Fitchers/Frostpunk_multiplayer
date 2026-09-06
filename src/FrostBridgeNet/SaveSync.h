@@ -87,7 +87,7 @@ public:
                 if(packet.phase==6) { fail("Peer could not complete the checkpoint operation.",false); return; }
                 if(host_ && packet.phase==2 && !dispatched_ && !peerReady_) {
                     peerReady_=true;
-                    log("[save] Клиент подтвердил готовность к сохранению/загрузке.");
+                    log("[save] The client confirmed readiness for save/load.");
                 }
                 else if(!host_ && packet.phase==3 && ready_ && !dispatched_) goRequested_=true;
                 else if(host_ && packet.phase==4 && dispatched_) peerDone_=true;
@@ -133,7 +133,7 @@ public:
             const auto current=state();
             if(!ready_ && !trading() && (!current.loaded || current.paused)) {
                 ready_=true;
-                log("[save] Город готов. Ожидаем подтверждения второго игрока.");
+                log("[save] City ready. Waiting for the other player.");
                 if(!host_) emit(2);
             }
             if(host_ && ready_ && peerReady_ && !dispatched_ && dispatch()) emit(3);
@@ -171,7 +171,7 @@ private:
         }
         store_.select(packet.slot);
         packet_=packet; active_=true;ready_=peerReady_=dispatched_=done_=peerDone_=commitSent_=goRequested_=false;
-        log("[save] Запрос получен; ожидаем паузы города.");
+        log("[save] Request received; waiting for the city to pause.");
         deadline_=Clock::now()+std::chrono::seconds(120);
         retryAt_=Clock::now()+std::chrono::seconds(1);
     }
@@ -185,7 +185,7 @@ private:
         wcsncpy_s(control_->commandName,store_.scratch(packet_.checkpoint).c_str(),_TRUNCATE);
         MemoryBarrier(); command_=InterlockedIncrement(&control_->commandSequence);
         dispatched_=true;stableSince_=Clock::now();lastSize_=0;
-        log("[save] Команда передана игре. Ожидаем файл сохранения или загрузку города.");
+        log("[save] Command delivered to the game. Waiting for the save file or loaded city.");
         return true;
     }
     void fail(const std::string& reason,bool notify=true) {

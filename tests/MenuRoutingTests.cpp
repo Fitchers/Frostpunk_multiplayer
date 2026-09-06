@@ -29,27 +29,27 @@ int main() {
     assert(openedForms == 0);
     index = 1;
     scenarioRowCallbackHook(nullptr, event);
-    assert(g_selectedConnection == 1);
-    assert(openedForms == 1 && openedTransport == 1); // Single LAN click opens form.
-    assert(originalCalls == 1); // LAN cannot enter scenario/DLC logic.
+    assert(g_selectedConnection == -1);
+    assert(openedForms == 0); // Hidden LAN/scenario rows cannot open a form.
+    assert(originalCalls == 1);
     index = 0;
     scenarioRowCallbackHook(nullptr, event);
     assert(g_selectedConnection == 0);
-    assert(openedForms == 2 && openedTransport == 0); // Steam also opens directly.
+    assert(openedForms == 1 && openedTransport == 0); // Steam opens directly.
     index = 2;
     scenarioRowCallbackHook(nullptr, event);
     assert(g_selectedConnection == 0); // Hidden scenarios are ignored.
     scenarioRowCallbackHook(nullptr, nullptr);
     assert(g_selectedConnection == 0);
-    assert(openedForms == 2); // Hidden/invalid rows never launch anything.
+    assert(openedForms == 1); // Hidden/invalid rows never launch anything.
 
     g_dialogOpen = true; // Avoid a real MessageBox in this headless test.
     scenariosStartCallbackHook(nullptr, event);
-    assert(openedForms == 3 && openedTransport == 0); // Legacy Select still works.
+    assert(openedForms == 2 && openedTransport == 0); // Legacy Select still works.
     assert(originalCalls == 1);
     g_multiplayerMode = false;
     scenariosStartCallbackHook(nullptr, event);
     assert(originalCalls == 2);
-    assert(openedForms == 3);
-    std::cout << "PASS: Steam/LAN routing, invalid selection, native scenario isolation.\n";
+    assert(openedForms == 2);
+    std::cout << "PASS: Steam-only routing, hidden transports, native scenario isolation.\n";
 }

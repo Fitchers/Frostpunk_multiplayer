@@ -78,10 +78,10 @@ try {
  foreach($child in $children) { $child.StandardInput.WriteLine('quit'); $child.StandardInput.Flush() }
  foreach($child in $children) { if(!$child.WaitForExit(5000)) { throw 'Bridge did not exit' } }
  $hostLog=$outputs[0].Result; $guestLog=$outputs[1].Result
- if(!$hostLog.Contains('[trade] Вы отправили Борис 50 угля.')) { throw 'Sender confirmation missing' }
- if(!$guestLog.Contains('[trade] Получено 50 угля от игрока Анна.')) { throw 'Recipient confirmation missing' }
- if(!$hostLog.Contains('[trade] Вы отправили Борис 50 сырой еды.')) { throw 'Repeated/resource-specific sender confirmation missing' }
- if(!$guestLog.Contains('[trade] Получено 50 сырой еды от игрока Анна.')) { throw 'Repeated/resource-specific recipient confirmation missing' }
+ if(!$hostLog.Contains('[trade] You sent Борис 50 coal.')) { throw 'Sender confirmation missing' }
+ if(!$guestLog.Contains('[trade] Received 50 coal from Анна.')) { throw 'Recipient confirmation missing' }
+ if(!$hostLog.Contains('[trade] You sent Борис 50 raw food.')) { throw 'Repeated/resource-specific sender confirmation missing' }
+ if(!$guestLog.Contains('[trade] Received 50 raw food from Анна.')) { throw 'Repeated/resource-specific recipient confirmation missing' }
  if($balances[0][4] -ne 30 -or $balances[1][4] -ne 65) { throw 'Partial debit was not refunded safely' }
  if($views[0].ReadInt32(216) -ne 0) { throw 'Overlay stayed busy after completion' }
  'PASS: arbitrary amounts, single core, bidirectional returns, invalid amounts rejected, repeated clicks, native apply handshake, debit-before-credit and partial-debit refund.'
