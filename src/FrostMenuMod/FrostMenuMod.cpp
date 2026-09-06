@@ -349,13 +349,10 @@ bool configureMenuPanel(void* panel) {
             if (!summary) summary = findText(button, "STORY_UNLOCKED");
 
             if (g_lastConfiguredPanel.load(std::memory_order_relaxed) != panel) {
-                // Liquid Engine's narrow-string converter uses Windows-1251 in
-                // this Russian build (not UTF-8).
-                constexpr char kTitle[] =
-                    "\xCC\xD3\xCB\xDC\xD2\xC8\xCF\xCB\xC5\xC5\xD0";
-                constexpr char kSummary[] =
-                    "* \xCD\xCE\xC2\xDB\xC9 CO-OP "
-                    "\xD0\xC5\xC6\xC8\xCC *";
+                // Keep the injected menu entry independent of the active game
+                // language. ASCII is accepted by Liquid Engine on every locale.
+                constexpr char kTitle[] = "MULTIPLAYER";
+                constexpr char kSummary[] = "* NEW CO-OP MODE *";
 
                 // These are the real names from the 1.6.1 UI tree. The names used
                 // by the menu's localization keys are not the element names.
